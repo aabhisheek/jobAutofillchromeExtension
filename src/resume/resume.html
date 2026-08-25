@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Tailor Resume</title>
+    <link rel="stylesheet" href="resume.css" />
+  </head>
+  <body>
+    <h1>Tailor Resume for a Job Description</h1>
+    <p class="muted">
+      Paste a job description below. Keywords it uses that already match something true in your
+      <code>profile.json</code> (skills, experience, projects) get surfaced into the resume as an
+      extra ATS-scannable line — nothing is fabricated. Keywords with no match in your profile are
+      listed as gaps for you to review, never inserted automatically. This produces updated LaTeX
+      source only; compile it to PDF via Overleaf (paste and Recompile) or ask Claude to run
+      pdflatex locally — nothing is uploaded anywhere by this page.
+    </p>
+    <p class="muted">
+      Opened this via the popup's "Tailor Resume for This Job" button? The description below was
+      auto-filled and analyzed from that page already — just double-check it grabbed the right text.
+    </p>
+
+    <div class="pdf-attach-box">
+      <label class="field-label" for="pdf-input">Compiled PDF (used by the popup's "Fill Selected Fields" to auto-attach on resume-upload fields)</label>
+      <input type="file" id="pdf-input" accept="application/pdf" />
+      <span id="pdf-status" class="muted"></span>
+    </div>
+
+    <label class="field-label" for="jd-input">Job description</label>
+    <textarea id="jd-input" placeholder="Paste the job description here…"></textarea>
+
+    <div class="toolbar">
+      <button id="analyze-btn">Analyze &amp; Tailor</button>
+      <span id="status" class="muted"></span>
+    </div>
+
+    <div id="results" class="hidden">
+      <div class="keyword-section">
+        <div>
+          <h2>Matched keywords <span class="muted">(true, added if missing from the resume)</span></h2>
+          <div id="matched-chips" class="chip-row"></div>
+        </div>
+        <div>
+          <h2>Gaps <span class="muted">(in the JD, not found in your profile — review manually)</span></h2>
+          <div id="missing-chips" class="chip-row"></div>
+        </div>
+      </div>
+
+      <h2>Preview — old vs. new</h2>
+      <div class="diff-grid">
+        <div>
+          <div class="pane-label">Current resume.tex</div>
+          <pre id="old-pane" class="code-pane"></pre>
+        </div>
+        <div>
+          <div class="pane-label">Tailored resume.tex <span class="muted">(added lines highlighted)</span></div>
+          <pre id="new-pane" class="code-pane"></pre>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button id="copy-btn">Copy Tailored .tex</button>
+        <button id="download-btn">Download Tailored .tex</button>
+        <span id="save-status" class="muted"></span>
+      </div>
+    </div>
+
+    <script src="../lib/schema.js"></script>
+    <script src="../lib/resume-tailor.js"></script>
+    <script src="resume.js"></script>
+  </body>
+</html>

@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Job Application Autofill</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Job Application Autofill</h1>
+      <div id="profile-summary" class="muted">Loading profile…</div>
+    </header>
+
+    <div id="no-profile" class="hidden">
+      <p>No profile saved yet.</p>
+      <button id="open-options">Open Options to set up your profile</button>
+    </div>
+
+    <div id="main" class="hidden">
+      <button id="scan-btn">Scan Form</button>
+      <div id="scan-status" class="muted"></div>
+
+      <div id="field-list"></div>
+
+      <div id="fill-bar" class="hidden">
+        <button id="fill-btn">Fill Selected Fields</button>
+        <span id="fill-status" class="muted"></span>
+      </div>
+    </div>
+
+    <footer>
+      <button id="footer-options" class="link-btn">Edit Profile</button>
+      <button id="footer-resume" class="link-btn">Tailor Resume for This Job</button>
+      <span class="muted">Nothing is ever submitted automatically.</span>
+    </footer>
+
+    <script src="../lib/schema.js"></script>
+    <script src="../lib/matcher.js"></script>
+    <script src="../lib/draft.js"></script>
+    <script src="../lib/page-scripts.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

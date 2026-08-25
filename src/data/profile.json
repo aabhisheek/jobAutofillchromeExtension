@@ -1,0 +1,95 @@
+{
+  "personal": {
+    "firstName": "Abhishek",
+    "lastName": "Anand",
+    "email": "anand.abhisheek@gmail.com",
+    "phone": "9650734826",
+    "address": "Jp Nagar, Bengaluru",
+    "city": "Bengaluru",
+    "state": "Karnataka",
+    "country": "India",
+    "zip": "560078"
+  },
+  "links": {
+    "linkedin": "https://www.linkedin.com/in/aabhisheekanand/",
+    "github": "https://github.com/aabhisheek",
+    "portfolio": ""
+  },
+  "education": [
+    {
+      "degree": "B.Tech",
+      "field": "Computer Science",
+      "institution": "KIIT University",
+      "startDate": "2021",
+      "endDate": "2025",
+      "gpa": "8"
+    }
+  ],
+  "experience": [
+    {
+      "company": "AuraCloud",
+      "title": "Software Engineer",
+      "startDate": "2025-08",
+      "endDate": "2026-08",
+      "current": false,
+      "technologies": ["Node.js", "Express.js", "MongoDB", "JWT", "RBAC", "React", "Next.js"],
+      "description": "Developed and maintained backend services and RESTful APIs using Node.js and Express.js. Designed database models and queries using MongoDB. Implemented authentication, authorization, and secure API access using JWT and RBAC. Integrated backend APIs with frontend applications built using React and Next.js. Worked on API validation, pagination, filtering, error handling, and performance improvements. Investigated and resolved production issues and bugs reported by QA and users. Collaborated with cross-functional teams using Git and Agile development practices."
+    },
+    {
+      "company": "Webnot Technologies",
+      "title": "Software Engineer Intern",
+      "startDate": "2025-04",
+      "endDate": "2025-07",
+      "current": false,
+      "technologies": ["Node.js", "Express.js", "MongoDB", "Mongoose", "JWT", "React"],
+      "description": "Developed RESTful APIs using Node.js and Express.js. Designed MongoDB schemas and implemented CRUD operations using Mongoose. Implemented authentication and authorization using JWT and role-based access control. Integrated backend APIs with React frontend components. Worked on API validation, pagination, filtering, and error handling. Assisted in debugging application issues and fixing QA-reported bugs."
+    }
+  ],
+  "projects": [
+    {
+      "name": "Employee Management Web Application",
+      "technologies": ["Node.js", "Express.js", "MongoDB", "React"],
+      "description": "Built backend APIs for managing employees, roles, and departments. Implemented JWT-based login and protected routes. Connected REST APIs with React frontend for data rendering and form handling. Optimized MongoDB queries and indexes for better performance."
+    },
+    {
+      "name": "E-commerce Platform (Learning Project)",
+      "technologies": ["Node.js", "Express.js", "MongoDB", "Next.js"],
+      "description": "Developed APIs for products, users, carts, and orders. Implemented server-side rendering using Next.js for SEO-friendly pages. Integrated payment workflow using mock gateways and webhook handling."
+    }
+  ],
+  "skills": [
+    "JavaScript",
+    "TypeScript",
+    "Java",
+    "C++",
+    "Node.js",
+    "Express.js",
+    "REST APIs",
+    "JWT Authentication",
+    "React.js",
+    "Next.js",
+    "HTML",
+    "CSS",
+    "MongoDB",
+    "PostgreSQL",
+    "Git",
+    "Postman",
+    "Docker",
+    "Linux",
+    "VS Code"
+  ],
+  "answers": {
+    "workAuthorization": "Authorized to work",
+    "requiresSponsorship": "No",
+    "noticePeriod": "15 days",
+    "currentSalary": "4.5 LPA",
+    "expectedSalary": "8 LPA",
+    "salaryExpectation": "8 LPA",
+    "willingToRelocate": "Yes",
+    "veteranStatus": "No",
+    "disabilityStatus": "No",
+    "gender": "Male",
+    "race": "South Asian",
+    "howDidYouHear": "Company website"
+  }
+}

@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Autofill Profile</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <h1>Your Profile</h1>
+    <p class="muted">
+      This is the single source of truth used to fill applications. Edit the JSON directly.
+      Sensitive fields (sponsorship, work authorization, EEO, etc.) live under
+      <code>answers</code> — leave any of them blank to force the extension to flag that
+      question as "unmatched" instead of guessing.
+    </p>
+
+    <div class="toolbar">
+      <button id="reload-bundled">Reload from profile.json</button>
+      <button id="download-profile">Download profile.json</button>
+      <button id="load-sample">Load Sample Profile</button>
+      <button id="save">Save</button>
+      <span id="status" class="muted"></span>
+    </div>
+    <p class="muted">
+      <code>src/data/profile.json</code> is bundled with the extension source and used as the
+      fallback whenever nothing is saved yet (fresh install, cleared storage, etc.) — so you don't
+      re-type your profile after unrelated code changes. Edit here and click Save to update your
+      live copy; click Download to export it back over the file in source control.
+    </p>
+
+    <textarea id="editor" spellcheck="false"></textarea>
+
+    <h1>AI Draft Answers</h1>
+    <p class="muted">
+      Used only for free-text questions your profile can't answer directly (e.g. "Describe a
+      project…"). Never used for sponsorship, work authorization, or EEO questions — those are
+      always taken verbatim from <code>answers</code> above, or left blank for you to fill in.
+    </p>
+
+    <div class="ai-settings">
+      <label class="checkbox-row">
+        <input type="checkbox" id="use-llm" />
+        Use an LLM to write drafts (otherwise a local template is used — no network call, no key needed)
+      </label>
+
+      <div id="llm-fields" class="hidden">
+        <p class="muted">Groq is tried first. If it fails or no Groq key is set, Gemini is used as a fallback.</p>
+
+        <label class="field-label" for="groq-key">Groq API key</label>
+        <input type="password" id="groq-key" placeholder="gsk_…" autocomplete="off" />
+        <label class="field-label" for="groq-model">Groq model</label>
+        <input type="text" id="groq-model" placeholder="openai/gpt-oss-120b" />
+
+        <label class="field-label" for="gemini-key">Gemini API key (fallback)</label>
+        <input type="password" id="gemini-key" placeholder="AIza…" autocomplete="off" />
+        <label class="field-label" for="gemini-model">Gemini model</label>
+        <input type="text" id="gemini-model" placeholder="gemini-flash-latest" />
+      </div>
+
+      <div class="toolbar">
+        <button id="reload-bundled-settings">Reload from settings.json</button>
+        <button id="download-settings">Download settings.json</button>
+        <button id="save-settings">Save AI Settings</button>
+      </div>
+      <span id="settings-status" class="muted"></span>
+      <p class="muted">
+        <code>src/data/settings.json</code> is bundled with the extension source and used as the
+        fallback whenever no AI settings are saved yet, so keys survive unrelated code changes.
+        It ships in cleartext inside the extension folder — keep it out of version control.
+      </p>
+    </div>
+
+    <script src="../lib/schema.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

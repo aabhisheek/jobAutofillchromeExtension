@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Job Application Autofill",
+  "version": "0.1.0",
+  "description": "Fills job application forms (Workday and similar ATS) from your saved profile. Always review before submitting.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "optional_host_permissions": ["https://api.groq.com/*", "https://generativelanguage.googleapis.com/*"],
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "Job Application Autofill"
+  },
+  "options_page": "src/options/options.html"
+}

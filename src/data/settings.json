@@ -1,0 +1,7 @@
+{
+  "useLLM": true,
+  "groqApiKey": "",
+  "groqModel": "openai/gpt-oss-120b",
+  "geminiApiKey": "",
+  "geminiModel": "gemini-flash-latest"
+}
