@@ -95,6 +95,7 @@ document.getElementById("load-sample").addEventListener("click", () => {
   };
   editor.value = JSON.stringify(sample, null, 2);
   status.textContent = "Sample loaded — edit and Save.";
+  Analytics.track("Sample Profile Loaded", {});
 });
 
 document.getElementById("save").addEventListener("click", async () => {
@@ -102,8 +103,18 @@ document.getElementById("save").addEventListener("click", async () => {
     const parsed = JSON.parse(editor.value);
     await chrome.storage.local.set({ profile: parsed });
     status.textContent = "Saved.";
+
+    // Shape only — how complete the profile is, never what is in it.
+    Analytics.track("Profile Saved", {
+      skill_count: Array.isArray(parsed.skills) ? parsed.skills.length : 0,
+      experience_count: Array.isArray(parsed.experience) ? parsed.experience.length : 0,
+      education_count: Array.isArray(parsed.education) ? parsed.education.length : 0,
+      project_count: Array.isArray(parsed.projects) ? parsed.projects.length : 0,
+      answered_question_count: Object.values(parsed.answers || {}).filter((v) => v).length
+    });
   } catch (err) {
     status.textContent = `Invalid JSON: ${err.message}`;
+    Analytics.track("Profile Save Failed", { error: "invalid json" });
   }
 });
 
@@ -115,6 +126,10 @@ const groqModelInput = document.getElementById("groq-model");
 const geminiKeyInput = document.getElementById("gemini-key");
 const geminiModelInput = document.getElementById("gemini-model");
 const settingsStatus = document.getElementById("settings-status");
+const analyticsEnabledCheckbox = document.getElementById("analytics-enabled");
+const analyticsFields = document.getElementById("analytics-fields");
+const mixpanelTokenInput = document.getElementById("mixpanel-token");
+const analyticsStatus = document.getElementById("analytics-status");
 
 const GROQ_ORIGIN = "https://api.groq.com/*";
 const GEMINI_ORIGIN = "https://generativelanguage.googleapis.com/*";
@@ -138,11 +153,33 @@ function applySettingsToFields(s) {
   groqModelInput.value = s.groqModel || DEFAULT_SETTINGS.groqModel;
   geminiKeyInput.value = s.geminiApiKey || "";
   geminiModelInput.value = s.geminiModel || DEFAULT_SETTINGS.geminiModel;
+  analyticsEnabledCheckbox.checked = s.analyticsEnabled !== false;
+  mixpanelTokenInput.value = s.mixpanelToken || "";
   syncLLMFieldsVisibility();
+  syncAnalyticsFieldsVisibility();
 }
 
 function syncLLMFieldsVisibility() {
   llmFields.classList.toggle("hidden", !useLLMCheckbox.checked);
+}
+
+function syncAnalyticsFieldsVisibility() {
+  analyticsFields.classList.toggle("hidden", !analyticsEnabledCheckbox.checked);
+}
+
+// The AI and Analytics sections both live in the single `settings` record, so
+// each Save writes the full object read back off the form — otherwise saving
+// one section would wipe the other's fields.
+function settingsFromFields() {
+  return {
+    useLLM: useLLMCheckbox.checked,
+    groqApiKey: groqKeyInput.value.trim(),
+    groqModel: groqModelInput.value.trim() || DEFAULT_SETTINGS.groqModel,
+    geminiApiKey: geminiKeyInput.value.trim(),
+    geminiModel: geminiModelInput.value.trim() || DEFAULT_SETTINGS.geminiModel,
+    analyticsEnabled: analyticsEnabledCheckbox.checked,
+    mixpanelToken: mixpanelTokenInput.value.trim()
+  };
 }
 
 async function loadSettings() {
@@ -174,14 +211,7 @@ document.getElementById("reload-bundled-settings").addEventListener("click", asy
 });
 
 document.getElementById("download-settings").addEventListener("click", () => {
-  const current = {
-    useLLM: useLLMCheckbox.checked,
-    groqApiKey: groqKeyInput.value.trim(),
-    groqModel: groqModelInput.value.trim() || DEFAULT_SETTINGS.groqModel,
-    geminiApiKey: geminiKeyInput.value.trim(),
-    geminiModel: geminiModelInput.value.trim() || DEFAULT_SETTINGS.geminiModel
-  };
-  const blob = new Blob([JSON.stringify(current, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify(settingsFromFields(), null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -190,8 +220,6 @@ document.getElementById("download-settings").addEventListener("click", () => {
   URL.revokeObjectURL(url);
   settingsStatus.textContent = "Downloaded — replace src/data/settings.json with this file to make it the new bundled default.";
 });
-
-useLLMCheckbox.addEventListener("change", syncLLMFieldsVisibility);
 
 document.getElementById("save-settings").addEventListener("click", async () => {
   const wantsLLM = useLLMCheckbox.checked;
@@ -224,17 +252,49 @@ document.getElementById("save-settings").addEventListener("click", async () => {
     chrome.permissions.remove({ origins: [GROQ_ORIGIN, GEMINI_ORIGIN] }).catch(() => {});
   }
 
-  await chrome.storage.local.set({
-    settings: {
-      useLLM: wantsLLM,
-      groqApiKey: groqKey,
-      groqModel: groqModelInput.value.trim() || DEFAULT_SETTINGS.groqModel,
-      geminiApiKey: geminiKey,
-      geminiModel: geminiModelInput.value.trim() || DEFAULT_SETTINGS.geminiModel
-    }
-  });
+  await chrome.storage.local.set({ settings: settingsFromFields() });
   settingsStatus.textContent = "AI settings saved.";
+
+  Analytics.track("AI Settings Saved", {
+    use_llm: wantsLLM,
+    has_groq_key: !!groqKey,
+    has_gemini_key: !!geminiKey,
+    groq_model: groqModelInput.value.trim() || DEFAULT_SETTINGS.groqModel,
+    gemini_model: geminiModelInput.value.trim() || DEFAULT_SETTINGS.geminiModel
+  });
 });
 
+useLLMCheckbox.addEventListener("change", syncLLMFieldsVisibility);
+analyticsEnabledCheckbox.addEventListener("change", syncAnalyticsFieldsVisibility);
+
+document.getElementById("save-analytics").addEventListener("click", async () => {
+  const enabled = analyticsEnabledCheckbox.checked;
+  const token = mixpanelTokenInput.value.trim();
+
+  await chrome.storage.local.set({ settings: settingsFromFields() });
+
+  // Tracked after the write, so background.js reads the new value: enabling
+  // records the opt-in even if analytics were previously off. Opting out is
+  // deliberately never tracked — by this point the record says disabled and
+  // background.js drops the event, which is exactly the intent.
+  Analytics.track("Analytics Settings Saved", { analytics_enabled: enabled, has_mixpanel_token: !!token });
+
+  if (!enabled) {
+    analyticsStatus.textContent = "Analytics off — no events are sent.";
+  } else if (!token) {
+    analyticsStatus.textContent = "Analytics on, but no Mixpanel token set — events stay queued locally until you add one.";
+  } else {
+    analyticsStatus.textContent = "Analytics settings saved.";
+  }
+});
+
+Analytics.init("options");
+
 load();
-loadSettings();
+loadSettings().then(() => {
+  Analytics.track("Options Page Opened", {
+    use_llm: useLLMCheckbox.checked,
+    has_groq_key: !!groqKeyInput.value.trim(),
+    has_gemini_key: !!geminiKeyInput.value.trim()
+  });
+});

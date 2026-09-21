@@ -110,7 +110,13 @@ const DEFAULT_SETTINGS = {
   groqApiKey: "",
   groqModel: "openai/gpt-oss-120b",
   geminiApiKey: "",
-  geminiModel: "gemini-flash-latest"
+  geminiModel: "gemini-flash-latest",
+  // Mixpanel product analytics. The token is a project's public write-only
+  // token (the same one a website ships in its page source), not a secret —
+  // it can only write events, never read them. Analytics stay dormant until
+  // one is set: src/background.js queues nothing it can't deliver.
+  analyticsEnabled: true,
+  mixpanelToken: ""
 };
 
 // src/data/settings.json is the base default; whatever's saved in
@@ -118,6 +124,8 @@ const DEFAULT_SETTINGS = {
 // an override only "counts" for a field if it's non-empty, so editing the
 // bundled file always takes effect for any field you haven't explicitly set
 // via the UI, instead of one saved settings record shadowing the whole file.
+// Note only "" is treated as unset, so a `false` override (e.g. turning
+// analyticsEnabled off) correctly wins over a bundled `true`.
 function mergeSettings(bundled, override) {
   const merged = { ...DEFAULT_SETTINGS, ...bundled };
   if (!override) return merged;

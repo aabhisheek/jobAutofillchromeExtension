@@ -2,6 +2,11 @@ let currentProfile = null;
 let currentRows = [];
 let currentSettings = { ...DEFAULT_SETTINGS };
 let currentResumePdf = null; // { base64, filename, mimeType, size, savedAt } | null — see src/resume/resume.js
+// ATS platform the popup was opened over ("workday", "greenhouse", …, or
+// "other"/"unknown"). Resolved once in init() and attached to the scan/fill
+// events so failures can be traced to a platform — the hostname itself is
+// never sent, see the privacy note in lib/analytics.js.
+let currentAts = "unknown";
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -185,6 +190,7 @@ async function scanCurrentTab(tabId) {
 
 async function handleScan() {
   const status = document.getElementById("scan-status");
+  const startedAt = performance.now();
   status.textContent = "Scanning…";
 
   const tab = await getActiveTab();
@@ -220,13 +226,28 @@ async function handleScan() {
 
     status.textContent = `${rows.length} fields found — ${autoCount} auto, ${reviewCount} need review, ${unmatchedCount} unmatched.`;
     renderRows(rows);
+
+    Analytics.trackTimed("Form Scanned", startedAt, {
+      ats: currentAts,
+      field_count: rows.length,
+      auto_count: autoCount,
+      review_count: reviewCount,
+      unmatched_count: unmatchedCount,
+      resume_upload_count: rows.filter((r) => r.status === "resume-upload").length,
+      draftable_count: rows.filter(isDraftCandidate).length,
+      // How many hydration rescans it took — if this trends toward MAX_RESCANS
+      // on a platform, the polling window is too short there.
+      rescan_attempts: attempt
+    });
   } catch (err) {
     status.textContent = `Could not scan this page: ${err.message}`;
+    Analytics.trackTimed("Form Scan Failed", startedAt, { ats: currentAts, error: err.message });
   }
 }
 
 async function handleGenerateDraft(idx, buttonEl) {
   const row = currentRows[idx];
+  const startedAt = performance.now();
   buttonEl.textContent = "Generating…";
   buttonEl.disabled = true;
 
@@ -234,6 +255,7 @@ async function handleGenerateDraft(idx, buttonEl) {
     const { text, source } = await generateDraft(row, currentProfile, currentSettings);
     if (!text) {
       buttonEl.textContent = "Not enough profile data — fill manually";
+      Analytics.trackTimed("Draft Generated", startedAt, { ats: currentAts, empty: true, use_llm: !!currentSettings.useLLM });
       return;
     }
     currentRows[idx] = {
@@ -244,9 +266,21 @@ async function handleGenerateDraft(idx, buttonEl) {
       draftSource: source
     };
     renderRows(currentRows);
+
+    // `source` is one of the fixed labels from generateDraft ("AI · Groq",
+    // "template (AI drafts off)", …) — a provider enum, not user content.
+    Analytics.trackTimed("Draft Generated", startedAt, {
+      ats: currentAts,
+      empty: false,
+      use_llm: !!currentSettings.useLLM,
+      draft_source: source,
+      // Length only — the drafted text itself is never transmitted.
+      draft_length: text.length
+    });
   } catch (err) {
     buttonEl.textContent = `Draft failed: ${err.message}`;
     buttonEl.disabled = false;
+    Analytics.trackTimed("Draft Failed", startedAt, { ats: currentAts, use_llm: !!currentSettings.useLLM, error: err.message });
   }
 }
 
@@ -263,9 +297,11 @@ async function handleFill() {
 
   if (textPayload.length === 0 && filePayload.length === 0) {
     status.textContent = "Nothing selected to fill.";
+    Analytics.track("Fill Attempted With Nothing Selected", { ats: currentAts, row_count: currentRows.length });
     return;
   }
 
+  const startedAt = performance.now();
   status.textContent = "Filling…";
 
   try {
@@ -296,15 +332,41 @@ async function handleFill() {
     if (textTotal) parts.push(`filled ${textOk}/${textTotal} fields`);
     if (filePayload.length) parts.push(`attached ${fileOk}/${filePayload.length} resume upload(s)`);
     status.textContent = `${parts.join(", ")}. Review the page before submitting.`;
+
+    Analytics.trackTimed("Fields Filled", startedAt, {
+      ats: currentAts,
+      text_selected: textTotal,
+      text_filled: textOk,
+      files_selected: filePayload.length,
+      files_attached: fileOk,
+      // Which of the scan's suggestions the user actually kept — the closest
+      // proxy this extension has for match quality.
+      auto_included: included.filter((r) => r.status === "auto").length,
+      review_included: included.filter((r) => r.status === "review").length,
+      edited_drafts_included: included.filter((r) => r.draftSource).length
+    });
   } catch (err) {
     status.textContent = `Fill failed: ${err.message}`;
+    Analytics.trackTimed("Fill Failed", startedAt, { ats: currentAts, error: err.message });
   }
 }
 
 async function init() {
+  Analytics.init("popup");
+
   currentProfile = await loadProfile();
   currentSettings = await loadSettings();
   currentResumePdf = await loadResumePdf();
+
+  const tab = await getActiveTab();
+  currentAts = atsVendor(tab && tab.url);
+
+  Analytics.track("Popup Opened", {
+    ats: currentAts,
+    has_profile: !!currentProfile,
+    has_resume_pdf: !!currentResumePdf,
+    use_llm: !!currentSettings.useLLM
+  });
 
   if (!currentProfile) {
     document.getElementById("no-profile").classList.remove("hidden");
@@ -320,8 +382,13 @@ async function init() {
 
 document.getElementById("scan-btn").addEventListener("click", handleScan);
 document.getElementById("fill-btn").addEventListener("click", handleFill);
-document.getElementById("open-options").addEventListener("click", () => chrome.runtime.openOptionsPage());
-document.getElementById("footer-options").addEventListener("click", () => chrome.runtime.openOptionsPage());
+function openOptionsFrom(entryPoint) {
+  Analytics.track("Options Opened From Popup", { ats: currentAts, entry_point: entryPoint });
+  chrome.runtime.openOptionsPage();
+}
+
+document.getElementById("open-options").addEventListener("click", () => openOptionsFrom("no-profile-prompt"));
+document.getElementById("footer-options").addEventListener("click", () => openOptionsFrom("footer"));
 // Grabs the JD off the current job page before handing off to the Resume
 // tab, so tailoring doesn't require copy-pasting it by hand. Best-effort:
 // scanJobDescription() (see page-scripts.js) always returns *something*
@@ -349,6 +416,17 @@ document.getElementById("footer-resume").addEventListener("click", async () => {
   if (pendingJD) {
     await chrome.storage.local.set({ pendingJD });
   }
+
+  // Only the scrape's outcome is reported (which strategy won, how much text,
+  // whether it was capped) — never the job description itself.
+  Analytics.track("Resume Tailoring Opened", {
+    ats: currentAts,
+    jd_captured: !!pendingJD,
+    jd_source: pendingJD ? pendingJD.source : "none",
+    jd_length: pendingJD ? pendingJD.text.length : 0,
+    jd_truncated: pendingJD ? !!pendingJD.truncated : false
+  });
+
   chrome.tabs.create({ url: chrome.runtime.getURL("src/resume/resume.html") });
 });
 

@@ -4,6 +4,8 @@ const BUNDLED_SETTINGS_URL = chrome.runtime.getURL("src/data/settings.json");
 
 let latestResult = null;
 
+Analytics.init("resume");
+
 async function loadProfile() {
   const { profile } = await chrome.storage.local.get("profile");
   if (profile) return profile;
@@ -88,6 +90,7 @@ async function handleAnalyze() {
     return;
   }
 
+  const startedAt = performance.now();
   status.textContent = "Analyzing…";
   document.getElementById("results").classList.add("hidden");
 
@@ -108,8 +111,19 @@ async function handleAnalyze() {
     status.textContent = `${result.matched.length} matched, ${result.missing.length} gap(s). ${addedNote}`;
 
     document.getElementById("results").classList.remove("hidden");
+
+    // Counts only. Neither the job description, the matched keywords, nor any
+    // resume text leaves the machine here.
+    Analytics.trackTimed("Resume Tailored", startedAt, {
+      jd_length: jdText.length,
+      matched_count: result.matched.length,
+      missing_count: result.missing.length,
+      added_count: result.addedKeywords.length,
+      use_llm: !!settings.useLLM
+    });
   } catch (err) {
     status.textContent = `Could not analyze: ${err.message}`;
+    Analytics.trackTimed("Resume Tailoring Failed", startedAt, { jd_length: jdText.length, error: err.message });
   }
 }
 
@@ -119,8 +133,10 @@ document.getElementById("copy-btn").addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(latestResult.tailoredText);
     saveStatus.textContent = "Copied — paste into Overleaf and Recompile.";
+    Analytics.track("Tailored Resume Exported", { method: "copy", added_count: latestResult.addedKeywords.length });
   } catch (err) {
     saveStatus.textContent = `Copy failed: ${err.message}`;
+    Analytics.track("Tailored Resume Export Failed", { method: "copy", error: err.message });
   }
 });
 
@@ -135,6 +151,7 @@ document.getElementById("download-btn").addEventListener("click", () => {
   a.click();
   URL.revokeObjectURL(url);
   saveStatus.textContent = "Downloaded — replace src/data/resume.tex with this file to make it the new bundled default, or compile it directly.";
+  Analytics.track("Tailored Resume Exported", { method: "download", added_count: latestResult.addedKeywords.length });
 });
 
 document.getElementById("analyze-btn").addEventListener("click", handleAnalyze);
@@ -147,6 +164,12 @@ document.getElementById("analyze-btn").addEventListener("click", handleAnalyze);
 // different job.
 (async () => {
   const { pendingJD } = await chrome.storage.local.get("pendingJD");
+
+  Analytics.track("Resume Page Opened", {
+    auto_filled: !!(pendingJD && pendingJD.text),
+    jd_source: pendingJD && pendingJD.text ? pendingJD.source : "none"
+  });
+
   if (!pendingJD || !pendingJD.text) return;
 
   await chrome.storage.local.remove("pendingJD");
@@ -186,6 +209,7 @@ document.getElementById("pdf-input").addEventListener("change", async (event) =>
 
   if (file.type !== "application/pdf") {
     pdfStatus.textContent = "Please choose a PDF file.";
+    Analytics.track("Resume PDF Rejected", { reason: "not a pdf" });
     return;
   }
 
@@ -195,6 +219,8 @@ document.getElementById("pdf-input").addEventListener("change", async (event) =>
     const record = { base64, filename: file.name, mimeType: file.type, size: file.size, savedAt: Date.now() };
     await chrome.storage.local.set({ resumePdf: record });
     renderPdfStatus(record);
+    // Size only — the PDF itself never leaves chrome.storage.local.
+    Analytics.track("Resume PDF Saved", { size_kb: Math.round(file.size / 1024) });
   };
   reader.onerror = () => {
     pdfStatus.textContent = `Could not read file: ${reader.error?.message || "unknown error"}`;

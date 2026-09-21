@@ -35,7 +35,7 @@ function scanFormFields() {
     if (el.getAttribute("aria-haspopup") === "listbox") return true;
     const comboboxAncestor = el.closest('[role="combobox"]');
     return !!(comboboxAncestor && comboboxAncestor !== el);
-  }
+  } 
 
   function labelForElement(el) {
     // 1. <label for="id">
@@ -248,7 +248,7 @@ function fillFormFields(payload) {
         (g) => g.value.toLowerCase() === item.value.toLowerCase() || (g.nextSibling?.textContent || "").toLowerCase().includes(item.value.toLowerCase())
       );
       if (target) {
-        setChecked(target, true);
+        setChecked(target, true);//dont go on the name;it sets the value as well if target is found.
         report.push({ uid: item.uid, ok: true });
       } else {
         report.push({ uid: item.uid, ok: false, reason: "no matching option" });
@@ -339,13 +339,16 @@ function scanJobDescription() {
   const MAX_LENGTH = 20000;
 
   function clean(text) {
-    return (text || "").replace(/ /g, " ").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+    return (text || "").replace(/ /g, " ").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();//cleaning and normalizing whitespace
   }
 
   function stripHtml(html) {
     const doc = new DOMParser().parseFromString(html, "text/html");
     return doc.body ? doc.body.textContent : "";
   }
+  //In one sentence:
+
+//stripHtml() converts an HTML string into a temporary DOM document and then uses textContent to extract the text while removing the HTML tags.
 
   function fromJsonLd() {
     const scripts = document.querySelectorAll('script[type="application/ld+json"]');
@@ -405,10 +408,13 @@ function scanJobDescription() {
   function fromLargestBlock() {
     const EXCLUDE_TAGS = new Set(["SCRIPT", "STYLE", "NAV", "HEADER", "FOOTER", "ASIDE", "SVG", "NOSCRIPT"]);
     const candidates = document.querySelectorAll("div, section, article, main");
+    //"Give me every <div>, <section>, <article>, and <main> on the page."
     let best = "";
     candidates.forEach((el) => {
       if (EXCLUDE_TAGS.has(el.tagName)) return;
+       //Skip elements having excluded tags 
       if (el.closest("nav, header, footer, aside")) return;
+      //Skip elements inside nav, header, footer, aside
       const style = window.getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") return;
       // Skip containers whose text is mostly duplicated from a bigger child

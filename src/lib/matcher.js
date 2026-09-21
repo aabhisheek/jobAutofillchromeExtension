@@ -25,7 +25,9 @@ function findDictionaryMatch(normalizedLabel) {
   for (const entry of FIELD_DICTIONARY) {
     for (const phrase of entry.phrases) {
       const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+      //
       const re = new RegExp(String.raw`(^|\s)${escaped}($|\s)`);
+      //
       if (re.test(normalizedLabel)) {
         return entry;
       }

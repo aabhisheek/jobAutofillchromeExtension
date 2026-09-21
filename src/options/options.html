@@ -70,7 +70,38 @@
       </p>
     </div>
 
+    <h1>Product Analytics</h1>
+    <p class="muted">
+      Sends anonymous usage events to Mixpanel so you can see which ATS platforms autofill actually
+      works on. <strong>Counts and platform names only</strong> — never a field value, your profile,
+      a job description, a resume, an API key, or the URL of any page you visit. Events are
+      identified by a random per-install id generated locally, and IP geolocation is disabled.
+    </p>
+
+    <div class="ai-settings">
+      <label class="checkbox-row">
+        <input type="checkbox" id="analytics-enabled" />
+        Send anonymous usage analytics to Mixpanel
+      </label>
+
+      <div id="analytics-fields">
+        <label class="field-label" for="mixpanel-token">Mixpanel project token</label>
+        <input type="text" id="mixpanel-token" placeholder="your project token" autocomplete="off" />
+        <p class="muted">
+          From Mixpanel → Project Settings → Project Token. This is a public, write-only token (the
+          same one a website ships in its page source), so it is safe to commit. Until one is set,
+          events are queued locally and nothing is sent.
+        </p>
+      </div>
+
+      <div class="toolbar">
+        <button id="save-analytics">Save Analytics Settings</button>
+        <span id="analytics-status" class="muted"></span>
+      </div>
+    </div>
+
     <script src="../lib/schema.js"></script>
+    <script src="../lib/analytics.js"></script>
     <script src="options.js"></script>
   </body>
 </html>
