@@ -1,26 +1,51 @@
 {
   "manifest_version": 3,
   "name": "Job Application Autofill",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Fills job application forms (Workday and similar ATS) from your saved profile. Always review before submitting.",
   "permissions": [
     "storage",
     "activeTab",
-    "scripting"
+    "scripting",
+    "sidePanel",
+    "alarms",
+    "identity"
   ],
   "host_permissions": [
-    "https://api.mixpanel.com/*"
+    "https://api.mixpanel.com/*",
+    "http://*/*",
+    "https://*/*"
   ],
   "optional_host_permissions": [
     "https://api.groq.com/*",
-    "https://generativelanguage.googleapis.com/*"
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.deepseek.com/*",
+    "https://openrouter.ai/*",
+    "https://api.together.xyz/*",
+    "https://api.mistral.ai/*",
+    "https://api.x.ai/*",
+    "https://api.openai.com/*",
+    "https://api.anthropic.com/*",
+    "http://localhost/*",
+    "https://gmail.googleapis.com/*",
+    "https://oauth2.googleapis.com/*"
   ],
   "background": {
     "service_worker": "src/background.js"
   },
   "action": {
-    "default_popup": "src/popup/popup.html",
     "default_title": "Job Application Autofill"
+  },
+  "side_panel": {
+    "default_path": "src/popup/popup.html"
+  },
+  "commands": {
+    "toggle-panel": {
+      "suggested_key": {
+        "default": "Alt+Shift+J"
+      },
+      "description": "Show or restore the Autofill side panel"
+    }
   },
   "options_page": "src/options/options.html"
 }

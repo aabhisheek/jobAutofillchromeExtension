@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Tailored resume — print</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: #1a1a1a;
+      }
+      #status {
+        margin: 0;
+        padding: 16px;
+        font-size: 13px;
+      }
+      #status.error { color: #b91c1c; }
+    </style>
+  </head>
+  <body>
+    <p id="status">Rendering the tailored resume…</p>
+
+    <script src="../lib/latex-preview.js"></script>
+    <script src="print.js"></script>
+  </body>
+</html>

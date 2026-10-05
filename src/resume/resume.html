@@ -11,9 +11,11 @@
       Paste a job description below. Keywords it uses that already match something true in your
       <code>profile.json</code> (skills, experience, projects) get surfaced into the resume as an
       extra ATS-scannable line — nothing is fabricated. Keywords with no match in your profile are
-      listed as gaps for you to review, never inserted automatically. This produces updated LaTeX
-      source only; compile it to PDF via Overleaf (paste and Recompile) or ask Claude to run
-      pdflatex locally — nothing is uploaded anywhere by this page.
+      listed as gaps for you to review, never inserted automatically. Your resume PDF is the source:
+      its text and structure are read back into LaTeX, previewed here as rendered A4 pages (old vs.
+      new), and written back out as a PDF via "Save as PDF". The PDF this extension already has is
+      picked up automatically — upload another below to replace it. Nothing is uploaded anywhere by
+      this page.
     </p>
     <p class="muted">
       Opened this via the popup's "Tailor Resume for This Job" button? The description below was
@@ -21,10 +23,30 @@
     </p>
 
     <div class="pdf-attach-box">
-      <label class="field-label" for="pdf-input">Compiled PDF (used by the popup's "Fill Selected Fields" to auto-attach on resume-upload fields)</label>
+      <label class="field-label" for="pdf-input">Your resume PDF — already loaded below if this extension has one; pick a different file here to replace it. The popup's "Fill Selected Fields" also auto-attaches this same PDF on resume-upload fields.</label>
       <input type="file" id="pdf-input" accept="application/pdf" />
+      <span id="pdf-source-status" class="muted"></span>
       <span id="pdf-status" class="muted"></span>
     </div>
+
+    <details class="tex-source-box" id="tex-source-box">
+      <summary>Use a .tex file instead (optional)</summary>
+      <p class="muted">
+        Only needed if you have LaTeX source and would rather not go through the PDF. Uploading a
+        PDF above is the normal path; this box takes over as the source when you use it. With neither
+        set, the "current" side is <code>resumeTexPath</code> from <code>settings.json</code>
+        (<code>src/data/resume.tex</code>).
+      </p>
+      <label class="field-label" for="tex-file-input">Upload a .tex file</label>
+      <input type="file" id="tex-file-input" accept=".tex,text/plain" />
+      <label class="field-label" for="tex-text-input">…or paste LaTeX source</label>
+      <textarea id="tex-text-input" placeholder="Paste resume.tex here…" spellcheck="false"></textarea>
+      <div class="toolbar">
+        <button id="tex-use-btn" type="button">Use this as the current resume</button>
+        <button id="tex-clear-btn" type="button">Back to the bundled resume.tex</button>
+        <span id="tex-status" class="muted"></span>
+      </div>
+    </details>
 
     <label class="field-label" for="jd-input">Job description</label>
     <textarea id="jd-input" placeholder="Paste the job description here…"></textarea>
@@ -47,9 +69,34 @@
       </div>
 
       <h2>Preview — old vs. new</h2>
-      <div class="diff-grid">
+      <div class="toolbar">
+        <div class="seg" id="view-toggle">
+          <button type="button" data-view="pages" class="active">Rendered pages</button>
+          <button type="button" data-view="source">LaTeX source</button>
+        </div>
+        <label class="field-label inline" for="engine-select">Engine</label>
+        <select id="engine-select" title="Built-in renderer is instant; the TeX engine is latex.js (closer to pdflatex, slower).">
+          <option value="fast">Fast (built-in)</option>
+          <option value="latexjs">Real TeX (latex.js)</option>
+        </select>
+        <button id="print-btn" type="button">Save as PDF</button>
+        <span id="preview-status" class="muted"></span>
+      </div>
+
+      <div class="diff-grid" id="pages-grid">
         <div>
-          <div class="pane-label">Current resume.tex</div>
+          <div class="pane-label">Current resume <span class="muted" id="old-source-label"></span></div>
+          <div id="old-pages" class="pages"></div>
+        </div>
+        <div>
+          <div class="pane-label">Tailored resume <span class="muted">(added keywords highlighted)</span></div>
+          <div id="new-pages" class="pages"></div>
+        </div>
+      </div>
+
+      <div class="diff-grid hidden" id="source-grid">
+        <div>
+          <div class="pane-label">Current resume.tex <span class="muted" id="old-source-label-tex"></span></div>
           <pre id="old-pane" class="code-pane"></pre>
         </div>
         <div>
@@ -66,7 +113,10 @@
     </div>
 
     <script src="../lib/schema.js"></script>
+    <script src="../lib/providers.js"></script>
     <script src="../lib/resume-tailor.js"></script>
+    <script src="../lib/latex-preview.js"></script>
+    <script src="../lib/pdf-extract.js"></script>
     <script src="../lib/analytics.js"></script>
     <script src="resume.js"></script>
   </body>

@@ -1,0 +1,143 @@
+/* API Keys screen: one card per provider, rendered from src/lib/providers.js so
+   adding a provider never means writing markup here.
+   The cards are a form, so they are laid out like a form: label above input,
+   consistent control heights, one obvious save. */
+
+.master { margin-bottom: 18px; }
+
+.providers {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.provider {
+  padding: 14px 16px 12px;
+  display: flex;
+  flex-direction: column;
+}
+
+.provider-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.provider-name {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+/* Cost tier as a small outlined label rather than a filled badge — it is
+   reference information, not state. */
+.provider-tier {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+}
+
+.provider-tier.paid { color: var(--warning); border-color: var(--warning-border); }
+
+.provider-blurb {
+  margin: 6px 0 0;
+  min-height: 34px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.provider-blurb .docs {
+  color: var(--text-subtle);
+  font-size: 11.5px;
+}
+
+.key-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.key-row input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px; }
+.key-row button { padding: 5px 9px; font-size: 12px; }
+
+.provider input[type="text"] { font-family: var(--mono); font-size: 12.5px; }
+
+/* Configured state is a green hairline plus a labelled dot: readable at a glance
+   across ten cards without turning the page into a status board. */
+.provider.configured { border-color: var(--success-border); }
+
+.provider-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-subtle);
+}
+
+.provider-foot .state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 500;
+}
+
+.provider-foot .state .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+
+.provider.configured .state { color: var(--success); }
+.provider.configured .state .dot { background: var(--success); }
+
+.provider-foot .test-result {
+  margin-left: auto;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.provider-foot .test-result.ok { color: var(--success); }
+.provider-foot .test-result.err { color: var(--danger); }
+
+.draft-extra { overflow: hidden; }
+.draft-extra > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.draft-extra > summary::-webkit-details-marker { display: none; }
+.draft-extra > summary::before { content: "+ "; font-family: var(--mono); }
+.draft-extra[open] > summary::before { content: "\2013 "; }
+.draft-extra > summary:hover { color: var(--text); background: var(--bg-hover); }
+.draft-extra[open] > summary { color: var(--text); border-bottom: 1px solid var(--border); }
+
+.draft-extra-body { padding: 14px 16px 16px; }
+
+.actions-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+}
+
+.footnote { max-width: 80ch; }
+
+@media (max-width: 560px) {
+  .providers { grid-template-columns: 1fr; }
+}

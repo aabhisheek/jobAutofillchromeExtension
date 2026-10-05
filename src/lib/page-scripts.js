@@ -37,7 +37,16 @@
 // attribute so that the field can later be found and filled.
 // ============================================================
 
-function scanFormFields() {
+function scanFormFields(platformConfig = {}, options = {}) {
+
+  // When true, fields whose label could not be resolved are reported as
+  // `dropped` rows carrying their surrounding markup, instead of vanishing.
+  // Off by default: a dropped field is not fillable, so surfacing it would show
+  // the user rows they cannot act on. Set only by the popup's diagnostics
+  // button, which needs the evidence to work out why a field was dropped.
+  //
+  const debugDropped = !!options.debugDropped;
+
 
   // Attribute used to uniquely identify each field after scanning.
   //
@@ -50,6 +59,34 @@ function scanFormFields() {
   // [data-autofill-uid="af-0"]
   //
   const AUTOFILL_ATTR = "data-autofill-uid";
+
+
+  // ============================================================
+  // CLEAR STALE UIDS FROM EARLIER SCANS
+  // ============================================================
+  //
+  // scanFormFields() runs many times on one page: the popup retries while the
+  // form is still rendering, and "Scan Form" can be pressed any number of
+  // times.
+  //
+  // The guards further down (notably `el.hasAttribute(AUTOFILL_ATTR)` in the
+  // custom-dropdown pass) read the attribute to dedupe fields *within a single
+  // run*. A uid left over from a previous run therefore reads as "already
+  // handled" and silently hides the field from every later scan.
+  //
+  // That is exactly how Workday's Degree dropdown
+  // (<button aria-haspopup="listbox" name="degree">BS</button>) disappeared
+  // from the popup: the first scan stamped data-autofill-uid="af-21" on it,
+  // so the second scan skipped it — while the element kept carrying af-21 in
+  // the page, which is the tell-tale sign.
+  //
+  // Clearing up front makes the attribute mean "seen during this scan", which
+  // is the only thing those guards ever assume.
+  //
+  Array.from(document.querySelectorAll(`[${AUTOFILL_ATTR}]`))
+    .forEach((el) => {
+      el.removeAttribute(AUTOFILL_ATTR);
+    });
 
 
   // Input types that should NOT be treated as normal form fields.
@@ -87,6 +124,151 @@ function scanFormFields() {
     "cv",
     "curriculum vitae"
   ];
+
+
+  // Placeholder texts a custom dropdown shows *as its own visible content*
+  // before any choice has been made.
+  //
+  // Example:
+  //
+  // <button aria-haspopup="listbox">Select One</button>
+  //
+  // When we go looking for the question this control answers, a placeholder
+  // like this is never the answer — it's noise, so it must not be mistaken
+  // for a label. Same list popup.js re-scans on (GENERIC_DROPDOWN_LABELS),
+  // duplicated here for the same reason RESUME_UPLOAD_KEYWORDS is.
+  //
+  const PLACEHOLDER_LABELS = new Set([
+    "select one",
+    "select",
+    "select...",
+    "choose one",
+    "choose",
+    "choose...",
+    "please select",
+    "-- select --",
+    "search",
+    "search...",
+    // Validation markers some forms render as the only text inside a field's
+    // label slot. They qualify the question, never replace it, so treating them
+    // as placeholders lets the search keep looking for the question itself.
+    "required",
+    "optional"
+  ]);
+
+
+  // Is this candidate text just dropdown/validation noise, with no question in
+  // it?
+  //
+  // A membership test against PLACEHOLDER_LABELS is not enough on its own,
+  // because the noise is not always the *whole* string. Workday renders an
+  // unanswered required question as one element containing the control's own
+  // text plus the marker:
+  //
+  //   <div class="css-label">Select One Required</div>
+  //
+  // An exact-match test passes that straight through as a label, so every such
+  // question ends up named "Select One Required" — identical to all the others,
+  // matching nothing, and impossible to fill. Removing each known noise phrase
+  // wherever it appears leaves only genuine question text, so a candidate that
+  // reduces to nothing is rejected and the search keeps walking up.
+  //
+  function stripPlaceholderNoise(text) {
+
+    let out = text;
+
+    for (const phrase of PLACEHOLDER_LABELS) {
+
+      // Escape the dots in "select..." / "choose..." so they stay literal.
+      const pattern = new RegExp(
+        phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "gi"
+      );
+
+      out = out.replace(pattern, " ");
+    }
+
+    // Punctuation left behind by the removals (" - ", " : ", stray dots).
+    out = out
+      .replace(/\s+/g, " ")
+      .trim();
+
+
+    // Required-field asterisk.
+    //
+    // Workday appends the marker as its own element inside the question:
+    //
+    //   <p>Do you have a non-compete?<abbr title="required">*</abbr></p>
+    //
+    // So the question's textContent ends in a bare "*". A trailing star is not
+    // part of the question, and leaving it attached changes the last word
+    // ("non-compete?*"), which is enough to stop a phrase match on it.
+    //
+    // Only a star at the very end is removed, and only where it directly abuts
+    // the end of the sentence — a "*" in the middle of a question is content.
+    //
+    return out
+      .replace(/\s*\*+\s*$/, "")
+      .replace(/^[\s\-–—:,.()]+|[\s\-–—:,.()]+$/g, "")
+      .trim();
+  }
+
+
+  // Extract the actual question sentence from long rich-text labels.
+  //
+  // Workday sometimes puts a long compliance preamble (paragraph + bullet list)
+  // inside the same <legend> as the question itself. The full textContent can
+  // run to hundreds of characters, but the field's question is almost always
+  // the sentence ending with a question mark — and often the last question
+  // mark in that block (the compliance text rarely ends with "?").
+  //
+  // Example:
+  //
+  //   "In line with U.S. export control laws... (bullets)... Do you now, or
+  //    have you held citizenship in any of the countries listed above?"
+  //
+  // Returning just that final sentence lets the matcher work and also keeps the
+  // label short enough that it isn't rejected by the length guard below.
+  //
+  function extractQuestionText(text) {
+
+    if (!text) {
+      return "";
+    }
+
+    // Split on sentence boundaries but keep the question mark attached.
+    const sentences = text
+      .split(/(?<=[.?!])\s+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+
+    // Prefer question sentences (those ending with ?). If there is more than
+    // one, take the last one — the actual yes/no question tends to come after
+    // any explanatory text on these compliance forms.
+    const questions = sentences.filter((s) => s.endsWith("?"));
+
+
+    if (questions.length) {
+      return questions[questions.length - 1];
+    }
+
+
+    // No question mark found. Look for common interrogative starts instead.
+    const starts = /^(do you|are you|will you|have you|did you|can you|could you|would you)/i;
+
+
+    for (let i = sentences.length - 1; i >= 0; i--) {
+      if (starts.test(sentences[i])) {
+        return sentences[i];
+      }
+    }
+
+
+    // Nothing obvious. Return the original trimmed text unchanged — the caller
+    // will still enforce its length guard.
+    return text.trim();
+  }
 
 
   // ============================================================
@@ -167,7 +349,7 @@ function scanFormFields() {
   //
   function textOf(el) {
     return (
-      el.textContent || ""
+      el?.textContent || ""
     )
       .replace(/\s+/g, " ")
       .trim();
@@ -198,6 +380,11 @@ function scanFormFields() {
   //drop down  is when you type fields name like i and in shows drop down 
   //options like India Indonesia and others 
   function isComboboxLike(el) {
+    // Platform adapters may identify controls their UI kit does not expose
+    // through standard ARIA combobox attributes (for example Workday's
+    // selectinput). Selectors live in the adapter, not this shared engine.
+    const platformSelectors = platformConfig.comboboxSelectors || [];
+    if (platformSelectors.some((selector) => el.matches(selector) || el.closest(selector))) return true;
 
     // Direct ARIA role:
     //
@@ -299,7 +486,9 @@ function scanFormFields() {
   // 5. placeholder
   // 6. nearby label-like element
   //
-  function labelForElement(el) {
+  // Strategies 1-7. Split out from labelForElement() so the generic-label
+  // rescue there can inspect what this resolved without duplicating the walk.
+  function resolveOwnLabel(el) {
 
 
     // ----------------------------------------------------------
@@ -354,7 +543,25 @@ function scanFormFields() {
     // The element directly provides its accessible label.
     //
     if (el.getAttribute("aria-label")) {
-      return el.getAttribute("aria-label").trim();
+
+      const ariaLabel =
+        stripPlaceholderNoise(el.getAttribute("aria-label"));
+
+      // Only trust it when it actually names the field.
+      //
+      // An unanswered dropdown's aria-label is frequently just its own
+      // placeholder plus the validation marker, with a leading space:
+      //
+      //   <button aria-label=" Select One Required">Select One</button>
+      //
+      // Returning that verbatim named every Workday question "Select One
+      // Required" — identical across the form, matching nothing. The real
+      // question sits in the <legend> a step or two away, so fall through to
+      // the later strategies instead of stopping on noise.
+      //
+      if (ariaLabel) {
+        return ariaLabel;
+      }
     }
 
 
@@ -396,7 +603,7 @@ function scanFormFields() {
         .filter(Boolean)
 
         // Extract the text from each matched element.
-        .map(textOf);c
+        .map(textOf);
 
 
       // If at least one referenced element was found,
@@ -528,6 +735,24 @@ function scanFormFields() {
     // elements whose class contains "label"
     // <legend>
     //
+    // This control's own field container, when the site marks one up.
+    //
+    // ATS forms put each question in its own wrapper and then repeat that
+    // wrapper for every question on the page:
+    //
+    //   <div data-automation-id="formField">…</div>   <- willing to relocate?
+    //   <div data-automation-id="formField">…</div>   <- have a non-compete?
+    //
+    // Once the search climbs above a control's own container, any label-like
+    // element it finds belongs to a *neighbouring* question, and since the walk
+    // returns the first match, every question that lacks inline text would be
+    // labelled with the same neighbour's wording. Recorded as the ceiling so the
+    // walk below stops there instead of borrowing another field's question.
+    //
+    const fieldBoundary =
+      el.closest('[data-automation-id*="formField" i]');
+
+
     let container = el.parentElement;
 
 
@@ -537,6 +762,18 @@ function scanFormFields() {
       depth < 4 && container;
       depth++
     ) {
+
+      // Above this control's own field container there is no label of ours to
+      // find — only other fields' questions. Stop rather than mislabel.
+      //
+      if (
+        fieldBoundary &&
+        container !== fieldBoundary &&
+        !fieldBoundary.contains(container)
+      ) {
+        break;
+      }
+
 
       // Find elements that look like labels.
       //
@@ -555,24 +792,97 @@ function scanFormFields() {
       //
       const candidates = Array.from(
         container.querySelectorAll(
-          "label, [class*='label' i], legend"
+          "label, [class*='label' i], legend," +
+            // Workday renders the question itself as a div with a
+            // data-automation-id rather than a <label>, e.g.
+            // data-automation-id="questionTitle" / "formFieldPrompt".
+            "[data-automation-id*='question' i]," +
+            "[data-automation-id*='prompt' i]," +
+            "[data-automation-id*='label' i]"
         )
       );
 
 
-      // Check every possible label.
+// Check every possible label.
       for (const c of candidates) {
 
         // Extract and normalize its text.
         const t = textOf(c);
 
 
+        // Drop the noise a dropdown carries with it, so what is left is the
+        // question alone — or nothing at all, if this candidate was only ever
+        // the control's placeholder and a "Required" marker.
+        //
+        let question = stripPlaceholderNoise(t);
+
+
+        // Pull out the actual question sentence if this is a long rich-text
+        // block (common on Workday compliance forms that lead with paragraphs
+        // and bullet lists before the yes/no question).
+        //
+        if (question) {
+          question = extractQuestionText(question);
+        }
+
+
+        // Still looks like a block of prose rather than a question.
+        //
+        // This happens when the country list in an export-control block runs
+        // into the question with nothing separating them, so the whole run is
+        // one "sentence":
+        //
+        //   "…accordingly.AfghanistanArmenia…CentralAfricanRepublicDo you
+        //    now, or have you held citizenship in any of the countries listed
+        //    above?"
+        //
+        // Sentence splitting cannot separate those, and the result can still fit
+        // under the length limit, so this is keyed on the run being long enough
+        // to be prose — well past any single question — rather than on the 150
+        // limit used for acceptance below.
+        //
+        if (question && question.length >= 90) {
+
+          // Anchor on a full opener phrase, not the bare words "do you" /
+          // "have you". The question often contains more than one of them
+          // ("Do you now, or have you held citizenship…"), and cutting at the
+          // last bare match would throw away the real opening.
+          //
+          // No leading \b: the country list runs straight into the question
+          // with no separator ("Bosnia-HerzegovinaDo you now, or…"), so there
+          // is no word boundary ahead of the real opening and requiring one
+          // would skip it and match only the later "have you", losing "Do you
+          // now, or". A trailing \b is kept so "young"/"yours" can't match.
+          //
+          // Instead try each occurrence as a starting point and keep the one
+          // that leaves the longest question — the full sentence always beats a
+          // fragment that begins mid-question.
+          const openerPattern =
+            /(?:do|are|will|have|did|can|could|would|is|was)\s+(?:you|your)\b/gi;
+
+          let best = "";
+
+          for (const match of question.matchAll(openerPattern)) {
+
+            const tail = question.slice(match.index).trim();
+
+            if (tail.length > best.length) {
+              best = tail;
+            }
+          }
+
+          if (best) {
+            question = best;
+          }
+        }
+
+
         // Ignore empty labels and extremely long text.
         //
         // A real field label should normally be relatively short.
         //
-        if (t && t.length < 150) {
-          return t;
+        if (question && question.length < 150) {
+          return question;
         }
       }
 
@@ -589,6 +899,227 @@ function scanFormFields() {
 
     // Nothing worked.
     return "";
+  }
+
+
+  // ============================================================
+  // RESCUE LABELS THAT ARE TOO GENERIC TO BE USEFUL
+  // ============================================================
+  //
+  // Some kits label a field only by its role in the question, not by the
+  // question itself: Google Forms' trailing free-text box on any "Other:"
+  // choice is simply aria-label="Other response". That label matches no
+  // dictionary entry and carries no information, so the row shows up as an
+  // unmatched mystery called "Other response".
+  //
+  // When an adapter declares genericLabelRescue, a label this bare is treated
+  // as a pointer upward rather than an answer: the real question is read off
+  // the enclosing question wrapper. The generic label is kept as a suffix so a
+  // human can still tell which box it is.
+  //
+  // Guarded by config, and only fires on a label that matched the declared
+  // pattern — so no platform without the config is affected.
+  //
+  function labelForElement(el) {
+    const own = resolveOwnLabel(el);
+
+    const rescue = platformConfig.genericLabelRescue;
+    if (!rescue || !rescue.genericPattern || !rescue.wrapperSelector || !rescue.labelSelector) {
+      return own;
+    }
+
+    let generic;
+    try {
+      generic = new RegExp(rescue.genericPattern, "i");
+    } catch {
+      return own;
+    }
+    if (!own || !generic.test(own.trim())) {
+      return own;
+    }
+
+    const wrapper = el.closest(rescue.wrapperSelector);
+    if (!wrapper) {
+      return own;
+    }
+
+    const heading = wrapper.querySelector(rescue.labelSelector);
+    const question = stripPlaceholderNoise(textOf(heading)).trim();
+    if (!question || question.length >= 150) {
+      return own;
+    }
+
+    return `${extractQuestionText(question)} (${own})`;
+  }
+
+
+  // ============================================================
+  // IDENTIFY THE UPLOAD WIDGET A FILE INPUT BELONGS TO
+  // ============================================================
+  //
+  // Is this input just the hidden bookkeeping half of a custom dropdown?
+  //
+  // Workday renders its dropdown questions as a sibling pair inside one
+  // wrapper: the <button aria-haspopup="listbox"> that the user actually
+  // clicks, and a text <input> whose value holds the selected option's
+  // internal ID.
+  //
+  //   <div class="css-12zup1l">
+  //     <button aria-haspopup="listbox" name="degree" id="...">BS</button>
+  //     <input type="text" value="281a47809d0e1000ee447dbff6e40000">
+  //     <span class="menu-icon">...</span>
+  //   </div>
+  //
+  // Only siblings sharing a parent with such a trigger count, so an ordinary
+  // text field that merely sits somewhere near a dropdown is left alone.
+  //
+  function isDropdownStateMirror(el) {
+
+    if (
+      el.tagName.toLowerCase() !== "input" ||
+      (el.getAttribute("type") || "text").toLowerCase() !== "text"
+    ) {
+      return false;
+    }
+
+    const parent = el.parentElement;
+
+    if (!parent) return false;
+
+    return !!parent.querySelector(
+      "button[aria-haspopup='listbox'], button[aria-haspopup='menu']," +
+        "[role='combobox'], [role='button'][aria-expanded]"
+    );
+  }
+
+
+  // ============================================================
+  //
+  // Is this control part of the surrounding website rather than the form?
+  //
+  // An application page is a full site: masthead, language and account menus,
+  // footer. Those carry `aria-haspopup` exactly like a real dropdown, so they
+  // have to be recognised by where they sit, not by what they say.
+  //
+  function isSiteChrome(el) {
+
+    // Built as a list and joined, so every entry is a complete selector. One
+    // long quoted string would put the comma *inside* the quotes and leave a
+    // stray `"` at the start of the next entry, which makes the whole group an
+    // invalid selector — and closest()/matches() throw on an invalid group
+    // rather than ignoring it, taking the scan down with them.
+    const chromeAncestors = [
+      "header",
+      "nav",
+      "footer",
+      `[data-automation-id="header"]`,
+      `[data-automation-id="navigationContainer"]`,
+      `[data-automation-id="utilityButtonBar"]`,
+      `[data-automation-id="footerContainer"]`
+    ];
+
+
+    if (el.closest(chromeAncestors.join(", "))) {
+      return true;
+    }
+
+
+    // Marked directly rather than only by position: these live in portal
+    // containers that are not inside a <header>, and their own ids are stable.
+    const chromeControls = [
+      `[data-automation-id="hammyMenuIcon"]`,
+      `[data-automation-id="utilityMenuButton"]`,
+      `[data-automation-id^="navigationItem-"]`
+    ];
+
+
+    return !!el.matches(chromeControls.join(", "));
+  }
+
+
+  // ============================================================
+  //
+  // Walks up from a file input looking for the widget that owns it, judged by
+  // the data-automation-id marks ATS platforms put on the container.
+  //
+  // Returns { isResume, label }:
+  //
+  //   isResume - some ancestor is marked as the resume widget
+  //   label     - that mark turned into readable text, for when the widget has
+  //              no <label> to read ("resumeUpload" -> "Resume Upload")
+  //
+  // Deliberately matched on "resume" only, and not on the looser
+  // RESUME_UPLOAD_KEYWORDS list, because these are opaque machine ids rather
+  // than human text: substring-matching a two-letter keyword like "cv" against
+  // arbitrary ids is how an unrelated upload gets mistaken for a resume.
+  //
+  function uploadWidgetOwner(el) {
+
+    let node = el.parentElement;
+
+    // Six levels covers the Workday nesting in practice
+    // (input -> drop-zone wrapper -> resumeUpload -> column -> section ->
+    // form); anything deeper than that is not this widget's own markup.
+    //
+    for (
+      let depth = 0;
+      depth < 6 && node;
+      depth++
+    ) {
+      const raw = (
+        node.getAttribute("data-automation-id") || ""
+      );
+
+      // Match case-insensitively, but hand humanizeAutomationId() the original
+      // casing — lowercasing first would flatten the camelCase boundary it
+      // splits on and turn "resumeUpload" into "Resumeupload".
+      if (raw.toLowerCase().includes("resume")) {
+        return {
+          isResume: true,
+          label: humanizeAutomationId(raw)
+        };
+      }
+
+      node = node.parentElement;
+    }
+
+    return {
+      isResume: false,
+      label: ""
+    };
+  }
+
+
+  // An adapter may designate one route as an unambiguous resume-first step.
+  // This lets the scanner accept its otherwise unnamed file input without
+  // making generic file uploads look like resumes.
+  function isConfiguredResumeStep() {
+    const rule = platformConfig.resumeStep;
+    if (!rule) return false;
+    return (
+      location.hostname.toLowerCase().endsWith(rule.hostnameSuffix.toLowerCase()) &&
+      location.pathname.toLowerCase().includes(rule.pathContains.toLowerCase())
+    );
+  }
+
+
+  // "resumeUpload"     -> "Resume Upload"
+  // "file_upload_ref"  -> "File Upload Ref"
+  //
+  // Split on camelCase and separators, then capitalize each word. Only ever
+  // used to name a row the user can recognize — it never becomes a filled-in
+  // value, so a clumsy translation costs nothing.
+  //
+  function humanizeAutomationId(id) {
+    return id
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/[-_]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(
+        /\b\w/g,
+        (c) => c.toUpperCase()
+      );
   }
 
 
@@ -706,6 +1237,13 @@ function scanFormFields() {
   const seenRadioGroups = new Set();
 
 
+  // Same job for adapter-configured ARIA groups, but keyed on the element
+  // rather than a string: seenRadioGroups holds "<input name>" keys, and an
+  // element interpolated into a key collapses to "[object HTMLDivElement]",
+  // which would make every choice group on the page look like the first one.
+  const seenChoiceContainers = new Set();
+
+
   // Process every discovered form element.
   simpleEls.forEach((el) => {
 
@@ -736,6 +1274,35 @@ function scanFormFields() {
       tag === "input" &&
       SKIP_TYPES.has(type)
     ) {
+      return;
+    }
+
+
+    // ==========================================================
+    // CUSTOM DROPDOWN'S HIDDEN STATE MIRROR
+    // ==========================================================
+    //
+    // A custom dropdown (Workday's Degree question, for example) is
+    // really three elements:
+    //
+    // <button aria-haspopup="listbox" name="degree">BS</button>
+    // <input type="text" value="281a47809d0e1000ee447dbff6e40000">
+    // <span class="menu-icon">...</span>
+    //
+    // The button is the real control and already gets a data-autofill-uid
+    // from the combobox scan. The <input> is not a field a human types into
+    // — it mirrors the selected option's internal ID so the widget's
+    // framework knows what is selected.
+    //
+    // It must never be listed or filled: typing an answer into it would
+    // replace an option ID with "B.Tech" and leave the dropdown showing
+    // garbage, and it would appear in the popup as a second copy of the
+    // same question.
+    //
+    // Relying on visibility is not enough — some of these are only clipped
+    // to 1px, not display:none, so they pass an isVisible() check.
+    //
+    if (isDropdownStateMirror(el)) {
       return;
     }
 
@@ -772,18 +1339,53 @@ function scanFormFields() {
 
 
       // Find the label associated with the file input.
-      const label = labelForElement(el);
+      //
+      // May come back empty — see the upload widget below.
+      //
+      let label = labelForElement(el);
 
 
-      // Check whether the label looks like a resume/CV field.
+      // ==========================================================
+      // RESUME UPLOAD WIDGET OWNER
+      // ==========================================================
+      //
+      // Workday names the widget around the input, not the input itself, and
+      // puts no <label> anywhere near it:
+      //
+      // <div data-automation-id="resumeUpload">
+      //   <div data-automation-id="file-upload-drop-zone">
+      //     Drop file here
+      //     <button data-automation-id="select-files">Select file</button>
+      //   </div>
+      //   <input data-automation-id="file-upload-input-ref" type="file">
+      // </div>
+      //
+      // Nothing in that subtree is a <label>, a [class*='label'], a <legend>,
+      // or carries a data-automation-id containing "question"/"prompt"/
+      // "label", so labelForElement() returns "" and a label-only test
+      // discards the field. On /apply/autofillWithResume this input is the
+      // only control on the page, which is precisely how a scan there ends up
+      // reporting zero fields.
+      //
+      // The widget's own data-automation-id is the only thing that names it, so
+      // it counts as a second source — both for recognizing the field and for
+      // the label shown in the popup ("resumeUpload" -> "Resume Upload").
+      //
+      const widget = uploadWidgetOwner(el);
+
+
+      // Check whether this looks like a resume/CV upload, from either source.
       //
       // For example:
       //
       // "Upload Resume"
       // "CV"
       // "Curriculum Vitae"
+      // data-automation-id="resumeUpload"
       //
       const isResumeField =
+        widget.isResume ||
+        isConfiguredResumeStep() ||
         RESUME_UPLOAD_KEYWORDS.some(
           (kw) =>
             label
@@ -800,6 +1402,15 @@ function scanFormFields() {
       //
       if (!isResumeField) {
         return;
+      }
+
+
+      // No <label> to show, but the widget is recognizable — name the row after
+      // it so the popup isn't a blank "Resume"-less entry the user can't
+      // identify. Only ever a synthesized name, never guessed content.
+      //
+      if (!label) {
+        label = widget.label || "Resume / CV upload";
       }
 
 
@@ -1240,8 +1851,755 @@ function scanFormFields() {
   });
 
 
+  // ============================================================
+  // FIND CUSTOM DROPDOWN / COMBOBOX CONTROLS
+  // ============================================================
+  //
+  // The pass above can only find real form tags:
+  //
+  // <input>
+  // <textarea>
+  // <select>
+  //
+  // Workday/Zebra (and most React-based ATS front-ends) build their
+  // dropdowns out of plain elements instead:
+  //
+  // <button aria-haspopup="listbox">Select One</button>
+  //
+  // or
+  //
+  // <div role="combobox">Select One</div>
+  //
+  // The options only exist in the DOM *after* the trigger is clicked:
+  //
+  // <ul role="listbox">
+  //   <li role="option">Yes</li>
+  //   <li role="option">No</li>
+  // </ul>
+  //
+  // So they are found here by their ARIA/custom-control markers, given a
+  // uid like any other field, and reported with inputType "combobox" so
+  // fillFormFields() drives them with click-then-pick instead of a
+  // value assignment.
+  //
+  const CUSTOM_CONTROL_SELECTOR = [
+    '[role="combobox"]',
+    '[aria-haspopup="listbox"]',
+    '[aria-haspopup="menu"]',
+    '[aria-haspopup="tree"]',
+    '[aria-haspopup="grid"]',
+    '[aria-haspopup="true"]',
+    '[data-automation-id="selectWidget"]',
+    '[data-automation-id="dropdownWidget"]'
+  ].join(", ");
+
+
+  document
+    .querySelectorAll(CUSTOM_CONTROL_SELECTOR)
+    .forEach((el) => {
+
+      // Already emitted by the pass above.
+      //
+      // This is how an <input role="combobox"> (react-select and friends)
+      // is avoided: it was already found as a normal text input and
+      // retyped to "combobox" there.
+      //
+      if (el.hasAttribute(AUTOFILL_ATTR)) {
+        return;
+      }
+
+
+      // Wraps a control the pass above already handled.
+      //
+      // Example:
+      //
+      // <div role="combobox">
+      //   <input>
+      // </div>
+      //
+      if (el.querySelector(`[${AUTOFILL_ATTR}]`)) {
+        return;
+      }
+
+
+      // Nested custom controls: only the outermost one is the trigger.
+      //
+      // Example:
+      //
+      // <div data-automation-id="selectWidget">
+      //   <button aria-haspopup="listbox">…</button>
+      // </div>
+      //
+      if (
+        el.parentElement &&
+        el.parentElement.closest(CUSTOM_CONTROL_SELECTOR)
+      ) {
+        return;
+      }
+
+
+      // Already open. That is still a field waiting to be filled, and
+      // fillCombobox() reads an open menu without re-clicking the trigger
+      // (clicking an expanded trigger only closes it again).
+      //
+      // Skipping it here used to make a dropdown left open by a failed fill
+      // vanish from the popup until the page was reloaded — the popup
+      // claiming a field does not exist while it sits right there on screen.
+      //
+
+
+      // Hidden/collapsed widgets (tabs not yet opened, mobile menus off
+      // screen) would fail the same visibility test as any other field.
+      //
+      if (!isVisible(el)) {
+        return;
+      }
+
+
+      // Page furniture that merely looks like a dropdown. A job application
+      // form is embedded in a full site shell, and Workday's shell is full of
+      // `aria-haspopup` triggers:
+      //
+      //   <button data-automation-id="hammyMenuIcon" aria-label="main menu">
+      //   <button id="languageSelectorButton" aria-haspopup="listbox">
+      //   <button id="accountSettingsButton" aria-haspopup="true">
+      //   <button data-automation-id="navigationItem-Home">
+      //
+      // None of them answer a question, so they only ever produced popup rows
+      // with nothing to fill in — and a fill would have opened the site's own
+      // menus. Judged by containment in the shell, not by the text of the
+      // button, so a form field that happens to read "Settings" survives.
+      //
+      if (isSiteChrome(el)) {
+        return;
+      }
+
+
+      // Find the question this control answers.
+      //
+      const label = labelForElement(el);
+
+
+// No question text, or nothing but placeholder/marker noise ("Select One",
+      // "Required") — the widget's real label wasn't wired up. Skipping beats
+      // showing the user a row they can't act on. Tested the same way the
+      // candidate search tests, so a label that survived the walk is not
+      // rejected here for being noise.
+      //
+      const question = stripPlaceholderNoise(label);
+
+      if (!question) {
+
+        // Record what was dropped, and why, instead of discarding it. The
+        // question text is in here somewhere under a selector this function
+        // does not match yet, and reading the page's own markup is the only
+        // reliable way to find it — guessing at the markup from outside has
+        // already been wrong more than once. Only the owning field container,
+        // not the whole page, and truncated because these can be large.
+        if (debugDropped) {
+
+          const owner =
+            el.closest('[data-automation-id*="formField" i]') ||
+            el.parentElement ||
+            el;
+
+          results.push({
+            uid: `drop-${counter++}`,
+            label: label || "(no label)",
+            tagName: "combobox",
+            inputType: "combobox",
+            options: [],
+            dropped: true,
+            debugHtml: owner.outerHTML.slice(0, 1500)
+          });
+        }
+
+        return;
+      }
+
+
+      const uid = `af-${counter++}`;
+
+
+      // Store the uid on the trigger itself.
+      el.setAttribute(AUTOFILL_ATTR, uid);
+
+
+      // Options stay []: the <li role="option"> elements don't exist until
+      // the popup is opened, and opening every dropdown during a scan
+      // would fight the page for focus. fillCombobox() reads them live.
+      results.push({
+        uid,
+        label,
+        tagName: "combobox",
+        inputType: "combobox",
+        options: []
+      });
+    });
+
+
+  // ============================================================
+  // ADAPTER-CONFIGURED CHOICE GROUPS
+  // ============================================================
+  //
+  // Some form kits render radio/checkbox questions as ARIA roles on <div>s
+  // instead of native inputs. Those never appear in the "input, textarea,
+  // select" sweep above, so on such a page every choice question is invisible
+  // and only its trailing "Other response" input turns up.
+  //
+  // Adapters opt in by supplying choiceGroups{...}; without a config this pass
+  // does nothing at all, so no existing platform changes behaviour.
+  //
+  const choiceConfig = platformConfig.choiceGroups;
+
+  if (choiceConfig && choiceConfig.containerSelector && choiceConfig.optionSelector) {
+    const valueAttributes = choiceConfig.valueAttributes || ["value", "aria-label"];
+
+    // An option belongs to the NEAREST enclosing container, not to every
+    // container that happens to contain it.
+    //
+    // Google Forms puts each question's role="radiogroup"/role="list" inside an
+    // outer role="list" wrapper that matches containerSelector too. Collecting
+    // plain descendants therefore hands every option on the page to the outer
+    // wrapper — one row carrying all nine questions' options, with the label
+    // read off the wrong ancestor. That row isn't degraded, it's wrong: the
+    // question text no longer describes the options, so neither the dictionary
+    // nor the model can answer it, and a multi-select matcher will cheerfully
+    // tick every skill it recognises.
+    //
+    // Claiming by nearest container gives each question exactly its own options
+    // and leaves the outer wrapper owning none, so it's dropped as empty.
+    const ownedBy = (container) =>
+      Array.from(container.querySelectorAll(choiceConfig.optionSelector)).filter(
+        (option) => option.closest(choiceConfig.containerSelector) === container
+      );
+
+    const containers = Array.from(document.querySelectorAll(choiceConfig.containerSelector));
+
+    // Whole-page fallback, not per-container. A per-container fallback
+    // reintroduces the very merge this rule exists to prevent: the outer wrapper
+    // owns nothing, so it would fall back to claiming all of them again. Instead
+    // the strict pass is all-or-nothing — if it finds no groups anywhere, the
+    // markup is shaped in a way this rule doesn't understand (a per-option
+    // wrapper, say) and the old descendant behaviour is used page-wide.
+    let claimed = containers.map(ownedBy);
+    if (!claimed.some((options) => options.length)) {
+      claimed = containers.map((container) =>
+        Array.from(container.querySelectorAll(choiceConfig.optionSelector))
+      );
+    }
+
+    // When a page yields one choice row out of nine, "the scanner didn't see
+    // it" and "the scanner saw it and discarded it" need different fixes and
+    // look identical from the popup. So every container reports its own verdict
+    // — how many options it holds, how many it owns, and which gate rejected it
+    // — instead of vanishing. Skipping a container is silent otherwise.
+    // The question text hangs off the container's aria-labelledby, so reuse
+    // the same multi-id resolution aria-labelledby fields already get.
+    const resolveChoiceLabel = (container) => {
+      let label = "";
+      const labelledBy = container.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        const parts = labelledBy.split(/\s+/)
+          .map((id) => document.getElementById(id))
+          .filter(Boolean)
+          .map((id) => stripPlaceholderNoise(textOf(id)))
+          .filter(Boolean);
+        if (parts.length) label = extractQuestionText(parts.join(" "));
+      }
+      if (!label) {
+        label = stripPlaceholderNoise(
+          textOf(
+            container.getAttribute("aria-label")
+              ? container
+              : container.querySelector("[role='heading']")
+          )
+        );
+      }
+      return label;
+    };
+
+    const describeChoiceContainer = (container, index, owned, visible, reason, label) => {
+      if (!debugDropped) {
+        return;
+      }
+
+      const descendants = Array.from(
+        container.querySelectorAll(choiceConfig.optionSelector)
+      );
+
+      results.push({
+        uid: `choice-skip-${index}`,
+        // The resolved question text, not the container's bare aria-label:
+        // Google Forms puts the question on aria-labelledby, so every row here
+        // would otherwise read "(no aria-label)" and a dump of skipped
+        // containers couldn't say which questions went missing.
+        label: label || container.getAttribute("aria-label") || "(unlabelled)",
+        tagName: "radiogroup",
+        inputType: "choice-scan",
+        options: [],
+        dropped: true,
+        debug: reason,
+        // Ownership, not just counts: a container that owns none of its own
+        // descendants is the nested-wrapper case, and one that owns fewer than
+        // it holds means an option's nearest enclosing container sits somewhere
+        // unexpected.
+        choiceScan: {
+          reason,
+          question: label || "",
+          role: container.getAttribute("role") || "",
+          className: (container.className || "").toString().slice(0, 80),
+          ariaLabelledBy: container.getAttribute("aria-labelledby") || "",
+          descendantOptions: descendants.length,
+          ownedOptions: owned.length,
+          visibleOptions: visible.length,
+          // Option texts are what the row would have displayed; empty ones
+          // explain a row that never appeared.
+          sample: descendants.slice(0, 6).map((o) => ({
+            role: o.getAttribute("role") || "",
+            text: stripPlaceholderNoise(textOf(o)).slice(0, 40),
+            value: o.getAttribute("data-value") || o.getAttribute("data-answer-value") || "",
+            visible: isVisible(o),
+            stamped: o.hasAttribute(AUTOFILL_ATTR)
+          }))
+        },
+        debugHtml: container.outerHTML.slice(0, 300)
+      });
+    };
+
+    containers.forEach((container, index) => {
+      const options = claimed[index].filter(isVisible);
+
+      // Resolved ahead of the gates below, which only skip containers. Reading
+      // it early costs nothing and lets a skipped container still name the
+      // question it was holding.
+      const questionLabel = resolveChoiceLabel(container);
+
+      // One option is not a question, and an empty container is a template
+      // Google Forms leaves in the DOM.
+      if (!options.length) {
+        describeChoiceContainer(
+          container,
+          index,
+          claimed[index],
+          options,
+          claimed[index].length ? "all-options-invisible" : "no-owned-options",
+          questionLabel
+        );
+        return;
+      }
+
+      // Options already claimed by the native radio/checkbox branches above.
+      if (options.some((o) => o.hasAttribute(AUTOFILL_ATTR))) {
+        describeChoiceContainer(
+          container,
+          index,
+          claimed[index],
+          options,
+          "options-already-stamped",
+          questionLabel
+        );
+        return;
+      }
+
+      // Dedupe on the container element itself.
+      //
+      // This cannot be a string key built from the container. Interpolating an
+      // element into a template literal calls toString() on it, and every
+      // HTMLDivElement stringifies to the same "[object HTMLDivElement]" — so
+      // "choice:" + container is one key shared by every choice group on the
+      // page, and the first group scanned silently discarded all the others as
+      // duplicates. That is what left a nine-question form showing one question
+      // with no error anywhere: ownership was correct, and each remaining
+      // container was rejected as a repeat of the first.
+      if (seenChoiceContainers.has(container)) {
+        describeChoiceContainer(
+          container,
+          index,
+          claimed[index],
+          options,
+          "container-already-seen",
+          questionLabel
+        );
+        return;
+      }
+      seenChoiceContainers.add(container);
+
+      const groupLabel = questionLabel || "Untitled question";
+
+      const emitted = options
+        .map((option) => {
+          // Prefer the attribute the site actually submits; aria-label is the
+          // last resort because it can be a rewritten string.
+          let value = "";
+          for (const attribute of valueAttributes) {
+            const candidate = option.getAttribute(attribute);
+            if (candidate && candidate.trim()) {
+              value = candidate.trim();
+              break;
+            }
+          }
+
+          // Visible text wins over attributes for display, and Google Forms
+          // nests it in a span.
+          const visible = textOf(
+            (choiceConfig.optionTextSelector && option.querySelector(choiceConfig.optionTextSelector)) || option
+          );
+          const text = stripPlaceholderNoise(visible) || value;
+
+          return value && text ? { value, text } : null;
+        })
+        .filter(Boolean);
+
+      if (!emitted.length) {
+        describeChoiceContainer(
+          container,
+          index,
+          claimed[index],
+          options,
+          "options-without-value-or-text",
+          questionLabel
+        );
+        return;
+      }
+
+      const uid = `af-${counter++}`;
+      options.forEach((option) => option.setAttribute(AUTOFILL_ATTR, uid));
+
+      // A group is multi-select when any option is a checkbox. This has to be
+      // recorded on the row: the filler has no other way to tell "tick these
+      // three" from "pick exactly one", and defaulting to single would
+      // silently drop every extra technology on a skills question.
+      const multiple = emitted.length > 1 &&
+        options.some((option) => option.getAttribute("role") === choiceConfig.multiSelectWhenRole);
+
+      results.push({
+        uid,
+        label: groupLabel,
+        tagName: "radiogroup",
+        inputType: multiple ? "checkbox" : "radio",
+        options: emitted,
+        multiple,
+        // Carried on the emitted row too, so a healthy group can be compared
+        // against the skipped ones in the same dump.
+        choiceScan: {
+          reason: "emitted",
+          question: groupLabel,
+          role: container.getAttribute("role") || "",
+          descendantOptions: container.querySelectorAll(choiceConfig.optionSelector).length,
+          ownedOptions: claimed[index].length,
+          visibleOptions: options.length
+        }
+      });
+    });
+  }
+
+
+  // ============================================================
+  // ADAPTER-CONFIGURED RESUME UPLOAD
+  // ============================================================
+  //
+  // The file-input branch above only fires on a real <input type="file">, which
+  // is why resume upload works on Workday and fails on Google Forms.
+  //
+  // Google Forms ships no file input at all until you click its "Add file"
+  // button:
+  //
+  //   <div id="i21" jsname="EpCqVb">Upload 1 supported file…</div>
+  //   <div jsname="kTlJSc" role="list" aria-label="Selected files"></div>
+  //   <div role="button" jsname="mWZCyf" aria-label="Add file">
+  //
+  // The input is created on demand, inside a shadow root, behind a click that
+  // also opens the OS file picker. So there is nothing to assign a File to
+  // during a scan, and the extension reported no resume field on the form at
+  // all — indistinguishable from having no resume saved.
+  //
+  // What can be detected is the trigger. Adapters name it, and the row is
+  // emitted against that trigger so the popup can at least show the field and
+  // say why it can't be filled automatically.
+  //
+  const resumeConfig = platformConfig.resumeUpload;
+
+  if (
+    resumeConfig &&
+    resumeConfig.triggerSelector &&
+    !results.some((field) => field.inputType === "file")
+  ) {
+    const triggers = Array.from(
+      document.querySelectorAll(resumeConfig.triggerSelector)
+    ).filter(isVisible);
+
+    triggers.forEach((trigger) => {
+      const uid = `af-${counter++}`;
+      trigger.setAttribute(AUTOFILL_ATTR, uid);
+
+      const question = trigger.closest("[role='listitem']");
+
+      // Google keeps the question text on the listitem's heading, the same way
+      // the choice pass reads it, so "Resume Link" is preferred over the
+      // generic button name for the row's label.
+      let label = "";
+      const heading = question && question.querySelector("[role='heading']");
+      if (heading) {
+        label = extractQuestionText(stripPlaceholderNoise(textOf(heading)));
+      }
+      if (!label) {
+        label =
+          stripPlaceholderNoise(textOf(trigger)) ||
+          trigger.getAttribute("aria-label") ||
+          "Resume / CV upload";
+      }
+
+      results.push({
+        uid,
+        label,
+        tagName: trigger.tagName.toLowerCase(),
+        inputType: "file",
+        options: [],
+        // Not fillable by assignment: there is no input to assign to until the
+        // user clicks through to the OS picker themselves.
+        resumeRequiresClick: true,
+        uploadTrigger: resumeConfig.triggerSelector
+      });
+    });
+  }
+
+
   // Return every field discovered on the page.
   return results;
+}
+
+
+// ============================================================
+// DESCRIBE FRAMES
+// ============================================================
+//
+// Injected with allFrames, so this runs once per frame: the top document and
+// every <iframe> inside it. It reports enough for the caller to answer the two
+// questions a cross-origin form raises — which frames are ready to be read, and
+// which ATS adapter each one belongs to.
+//
+// Both are needed because the form is frequently not in the page you are
+// looking at. ChargePoint's /about/opportunities/job, for one, renders a shell
+// whose entire content is a cross-origin <iframe> pointing at
+// job-boards.greenhouse.io. The top document holds the site's own navigation
+// and nothing else, so scanning it returns no application fields and no amount
+// of waiting changes that — it reads as a page that is still rendering, and
+// burned six rescans saying so. The frame holding the form has to be scanned in
+// its own right, against the adapter matching its URL rather than the one
+// matching the page that happens to host it.
+//
+// origin, not the full URL: the adapter matchers only look at the hostname,
+// and a path or query here can carry a job id (see the privacy contract in
+// lib/analytics.js — nothing read off the page is sent anywhere).
+//
+// IMPORTANT: self-contained, like every function in this file — it is
+// serialized and injected on its own.
+// ============================================================
+
+function describeFrames() {
+
+  return {
+    // Whether this is the top document rather than a frame inside it. The
+    // caller's fallback path (a page it cannot enumerate frames on) is the top
+    // document, so it needs to be able to tell which one it is looking at.
+    top: window.top === window,
+
+    // "loading" while the frame is still parsing. A frame that has not finished
+    // parsing has not produced its controls yet, however settled its counts
+    // look — so this is checked alongside the counts, never instead of them.
+    readyState: document.readyState,
+
+    // Form controls in THIS frame. Read as counts only, so a frame that is up
+    // but still streaming its questions shows up as a rising number across
+    // polls instead of a short but plausible scan.
+    controls: document.querySelectorAll("input, textarea, select").length,
+
+    // Nested frames declared here. Summed over every reporting frame this gives
+    // the size the frame tree should end up at, so a frame that has not loaded
+    // yet — and so cannot report anything about itself — still gets counted.
+    frames: document.querySelectorAll("iframe").length,
+
+    origin: (() => {
+      try {
+        return location.origin;
+      } catch {
+        // An opaque origin (a sandboxed frame) has none, which is a perfectly
+        // ordinary answer: it falls back to the adapter for the host page.
+        return null;
+      }
+    })()
+  };
+}
+
+
+// ============================================================
+// WAIT FOR FORM READY
+// ============================================================
+//
+// Google Forms streams its questions into the DOM. Scanning a page that has
+// only rendered the first few returns a perfectly valid-looking result: the
+// fields that exist are read correctly, and everything below is simply absent,
+// so the scan reports "1 of 9 choice questions found" with no error anywhere.
+// There is nothing downstream that can recover from that — the matcher never
+// sees a label it could not match, and the AI is only asked about fields the
+// scan produced.
+//
+// So the scan has to wait for the DOM to settle before it reads it. Waiting on
+// a fixed delay is worse than useless: it is either too short on a slow
+// connection or wasted time on a fast one. Instead this watches the count of
+// candidate controls and exits as soon as it stops changing.
+//
+// Only counts are used, never contents, so nothing about the page leaves here.
+//
+// IMPORTANT: self-contained, like every function in this file — it is
+// serialized and injected on its own.
+// ============================================================
+
+async function waitForFormReady(platformConfig = {}, timeoutMs = 2500) {
+
+  // Fast enough to feel instant on a settled page, slow enough that a burst of
+  // questions landing in one tick isn't mistaken for the end of rendering.
+  const POLL_MS = 150;
+
+  // Consecutive identical samples required before the DOM counts as settled.
+  // Three polls of one question at a time is the shape of progressive
+  // rendering, so a single stable sample would exit during it.
+  const STABLE_POLLS = 4;
+
+  const choiceConfig = platformConfig.choiceGroups;
+
+  const count = () =>
+    document.querySelectorAll("input, textarea, select").length +
+    (choiceConfig && choiceConfig.optionSelector
+      ? document.querySelectorAll(choiceConfig.optionSelector).length
+      : 0);
+
+  const deadline = Date.now() + Math.max(0, timeoutMs || 0);
+
+  let previous = count();
+  let stable = 0;
+
+  // document.readyState is checked as well as the counts: a page still
+  // parsing has not finished producing its controls yet, however stable the
+  // count looks in the meantime.
+  while (document.readyState === "loading" || stable < STABLE_POLLS) {
+    if (Date.now() >= deadline) {
+      break;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+
+    const current = count();
+
+    stable = current === previous ? stable + 1 : 0;
+    previous = current;
+  }
+
+  return {
+    controls: previous,
+    // Reported so the caller can say the page was still rendering rather than
+    // letting a timeout pass as a completed scan.
+    settled: stable >= STABLE_POLLS
+  };
+}
+
+
+// ============================================================
+// PROBE PAGE STATE
+// ============================================================
+//
+// Answers "why did the scan come back empty?" for a page that has none of the
+// expected form controls.
+//
+// scanFormFields() can't report this itself: it returns a flat array of
+// fields, and a result that would need to carry diagnostics alongside them
+// would change the shape popup.js and matchFields() consume.
+//
+// The distinction matters because the two causes need opposite fixes. A
+// client-rendered ATS that hasn't finished rendering (Workday's
+// /apply/autofillWithResume parses the uploaded resume before it shows the
+// form) needs a wait; a form living inside an <iframe> can't be reached from
+// the top document at all and needs a host permission instead. Without these
+// numbers "0 fields found" is indistinguishable between the two.
+//
+// IMPORTANT: self-contained, like every function in this file — it is
+// serialized and injected on its own. No URL is returned on purpose: the page
+// address is never sent anywhere (see the privacy note in lib/analytics.js),
+// and keeping it out of this payload removes any chance of it reaching the
+// analytics event that consumes these numbers.
+// ============================================================
+
+function probePageState(platformConfig = {}) {
+
+  // Every form control in the top document, however rendered.
+  //
+  const all = Array.from(
+    document.querySelectorAll(
+      "input, textarea, select"
+    )
+  );
+
+
+  // How many of those a human could actually see and fill in. Repeats
+  // scanFormFields()'s own isVisible() test rather than trusting the counts,
+  // because "12 controls in the DOM, 0 visible" (a hidden wizard step, a
+  // collapsed section) is the single most useful thing to be able to report.
+  //
+  const visible = all.filter((el) => {
+
+    if (
+      !el.offsetParent &&
+      el.offsetWidth === 0 &&
+      el.offsetHeight === 0
+    ) {
+      return false;
+    }
+
+    const style = window.getComputedStyle(el);
+
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden"
+    );
+  });
+
+
+  return {
+    readyState: document.readyState,
+
+    // Total form controls present in the DOM.
+    total: all.length,
+
+    // How many are visible right now.
+    visible: visible.length,
+
+    // Iframes present. A non-zero count on a page with no visible fields is
+    // the signature of a form the top document simply cannot see.
+    //
+    iframes: document.querySelectorAll("iframe").length,
+
+    // Rough size of the rendered page, used only to tell a still-empty SPA
+    // shell apart from a page that has finished loading.
+    //
+    textLength: (document.body?.innerText || "").trim().length,
+
+
+    // ARIA-built choice widgets, which the input/textarea/select sweep above
+    // cannot see at all. On a Google Form these are the questions themselves,
+    // so "0 inputs but 9 groups" is a fully-rendered form — and "9 inputs but
+    // 1 group" is a form still streaming, which is the case that produced
+    // scans missing eight questions with nothing to indicate why.
+    //
+    choiceGroups: platformConfig.choiceGroups?.containerSelector
+      ? document.querySelectorAll(platformConfig.choiceGroups.containerSelector).length
+      : 0,
+
+
+    choiceOptions: platformConfig.choiceGroups?.optionSelector
+      ? document.querySelectorAll(platformConfig.choiceGroups.optionSelector).length
+      : 0
+  };
 }
 
 
@@ -1264,9 +2622,16 @@ function scanFormFields() {
 //
 // Returns a report telling the caller whether each field
 // was successfully processed.
+//
+// Async because a custom dropdown/combobox can only be filled by
+// clicking it open, waiting for the page to render its
+// <li role="option"> list, then clicking the matching option — that
+// wait has to happen between steps. chrome.scripting.executeScript
+// awaits a returned promise, so the report still arrives intact at
+// popup.js.
 // ============================================================
 
-function fillFormFields(payload) {
+async function fillFormFields(payload, platformConfig = {}) {
 
   // Same attribute used by scanFormFields().
   const AUTOFILL_ATTR = "data-autofill-uid";
@@ -1332,39 +2697,62 @@ function fillFormFields(payload) {
   // radio
   //
   function setChecked(el, checked) {
+    if (el.checked === checked) return;
 
-    // Get the native "checked" setter.
-    const setter =
-      Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype,
-        "checked"
-      ).set;
+    // Workday's radios are controlled components. `click()` runs the native
+    // radio activation behaviour first, then emits the trusted sequence of
+    // click/input/change events its React handler consumes. Assigning
+    // `checked` and dispatching a synthetic event can leave the visual radio
+    // selected while Workday's form state remains unchanged.
+    if (checked) {
+      el.click();
+      return;
+    }
 
-
-    // Set checked state.
-    setter.call(el, checked);
-
-
-    // Fire events so the page/framework knows that the state changed.
-    el.dispatchEvent(
-      new Event("click", {
-        bubbles: true
-      })
-    );
-
-
-    el.dispatchEvent(
-      new Event("input", {
-        bubbles: true
-      })
-    );
+    // This extension only asks setChecked() to select an answer today, but
+    // retain a correct uncheck path for future callers.
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "checked").set;
+    setter.call(el, false);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
 
 
-    el.dispatchEvent(
-      new Event("change", {
-        bubbles: true
-      })
-    );
+  // Select one option inside a choice group.
+  //
+  // setChecked() only understands native inputs: it reads `.checked` and calls
+  // `.click()`. An ARIA option is a <div>, so `.checked` is undefined and its
+  // selected state lives in aria-checked/aria-selected instead. Reading that
+  // back after the click is also the only reliable confirmation that the
+  // widget's own handler accepted the choice — a div can swallow a click
+  // without warning.
+  function selectChoice(el) {
+    const role = el.getAttribute("role");
+    const isAriaChoice =
+      role === "radio" ||
+      role === "checkbox" ||
+      role === "menuitemradio" ||
+      role === "menuitemcheckbox" ||
+      role === "option";
+
+    if (!isAriaChoice) {
+      setChecked(el, true);
+      return true;
+    }
+
+    const selected = () =>
+      el.getAttribute("aria-checked") === "true" ||
+      el.getAttribute("aria-selected") === "true";
+
+    if (selected()) return true;
+
+    // Widgets built on divs often ignore a bare .click() and listen for the
+    // pointer sequence, so replay it as a human would.
+    humanClick(el);
+    if (selected()) return true;
+
+    el.click();
+    return selected();
   }
 
 
@@ -1389,11 +2777,1028 @@ function fillFormFields(payload) {
   //   reason: "element not found"
   // }
   //
+  // ==========================================================
+  // NORMALIZE TEXT
+  // ==========================================================
+  //
+  // "\n   First   Name \n"
+  //
+  // becomes:
+  //
+  // "First Name"
+  //
+  // Duplicated from scanFormFields() because this function is
+  // serialized and injected on its own — it cannot reach that
+  // function's closure.
+  //
+  function textOf(el) {
+    return (
+      el?.textContent || ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+
+  // ==========================================================
+  // SIMULATE A REAL USER CLICK
+  // ==========================================================
+  //
+  // Custom dropdowns are React components. They ignore a plain
+  // el.value = "Yes" entirely, because their state only ever
+  // changes through their own event handlers.
+  //
+  // So we replay the full pointer/mouse sequence a real click
+  // produces, in the same order the browser would:
+  //
+  // pointerdown -> mousedown -> (focus) -> pointerup -> mouseup -> click
+  //
+  // React listens for mousedown on some widgets (to open a popup)
+  // but click on others (to commit a choice), so all of them fire.
+  //
+  function humanClick(el) {
+    const base = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      button: 0,
+      buttons: 1
+    };
+
+    [
+      "pointerdown",
+      "mousedown",
+      "pointerup",
+      "mouseup"
+    ].forEach((type) => {
+      el.dispatchEvent(
+        new MouseEvent(type, base)
+      );
+    });
+
+    el.click();
+  }
+
+
+  // ==========================================================
+  // WAIT FOR THE OPTION LIST TO APPEAR
+  // ==========================================================
+  //
+  // Clicking a dropdown trigger asks the framework to render its
+  // popup. React renders asynchronously, so at the instant we look
+  // for [role="option"] there usually isn't one yet.
+  //
+  // We poll for up to OPTION_WAIT_MS before giving up, because the
+  // delay ranges from ~0ms (already-open popup) to a few hundred ms
+  // for a slow ATS page. Polling beats a single fixed sleep: it
+  // returns as soon as the list is really there.
+  //
+  const OPTION_WAIT_MS = 1500;
+  const OPTION_POLL_MS = 50;
+
+
+  // How long to wait for a click on an option to be reflected back in the
+  // markup before concluding it did nothing.
+  const OPTION_SETTLE_MS = 600;
+
+
+  // Whether this option now reads as chosen.
+  //
+  // Both spellings turn up on real ATS option rows: Workday's menuItem carries
+  // aria-selected and data-automation-selected, and the leaf node inside it
+  // carries data-uxi-multiselectlistitem-isselected. Checking the subtree too
+  // matters because the marker can land on either level depending on the
+  // widget.
+  function optionIsSelected(el) {
+    return !!el.querySelector &&
+      [el, ...el.querySelectorAll("*")].some((n) => {
+        if (n.getAttribute("aria-selected") === "true") {
+          return true;
+        }
+        if (n.getAttribute("data-automation-selected") === "true") {
+          return true;
+        }
+        const uxi = n.getAttribute("data-uxi-multiselectlistitem-isselected");
+        return uxi === "true" || uxi === "checked";
+      });
+  }
+
+
+  // Whether a click on `row` was accepted: either the widget marked the row
+  // selected, or it closed the menu over it.
+  //
+  // The second case is why this can't just poll for aria-selected. A plain
+  // dropdown replaces the list once a choice is made, so the clicked node
+  // leaves the DOM while the selection very much did happen — reading that as
+  // failure would make a working fill report a broken one. Lists that are only
+  // hidden (the row stays in the DOM, the menu collapses) read the same way, so
+  // a row that stops being visible counts too.
+  async function selectionTook(row, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+
+    for (;;) {
+      if (!row.isConnected || optionIsSelected(row) || !isVisibleOption(row)) {
+        return true;
+      }
+
+      if (Date.now() >= deadline) {
+        return false;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, OPTION_POLL_MS));
+    }
+  }
+
+
+  // Collect the option elements currently on the page.
+  //
+  // After a trigger click, an open popup looks like:
+  //
+  // <ul role="listbox">
+  //   <li role="option">Yes</li>
+  //   <li role="option">No</li>
+  // </ul>
+  //
+  // Some widgets (react-select) instead render
+  // <div role="option">. Both are covered.
+  //
+  function openOptions() {
+    const selectors = [
+      '[role="option"]',
+      '[role="menuitemradio"]',
+      '[role="menuitemcheckbox"]',
+      '[role="menuitem"]',
+      ...(platformConfig.optionSelectors || [])
+    ];
+    return Array.from(
+      document.querySelectorAll(selectors.join(", "))
+    ).filter(
+      // Not a choice on offer, just a readout of what is already selected.
+      //
+      // Workday renders the current answer as an option of its own:
+      //
+      // <li role="option" aria-selected="true"><div>BS</div></li>
+      //
+      // and a multiselect renders each chosen value as a dismissable pill
+      // with role="option" too. Neither can be "picked" — clicking the pill
+      // removes the answer, and clicking the selected row is a no-op that
+      // leaves the dropdown showing its old value, which is exactly the
+      // "it still says BS" outcome.
+      (el) =>
+        el.getAttribute("aria-selected") !== "true" &&
+        el.getAttribute("data-automation-id") !== "selectedItem"
+    );
+  }
+
+
+  // The options that belong to *this* trigger, when the widget says which.
+  //
+  // An open trigger points at its own menu via aria-controls, and Workday sets
+  // it (`aria-controls="hcxk10"` -> the degree listbox). Matching inside that
+  // one container is what keeps a fill from reaching into another widget's menu
+  // — this page has a Field of Study multiselect with 323 options open at the
+  // same time as the Degree dropdown, and both are `role="option"`.
+  function triggerOptions(el) {
+
+    const id = el.getAttribute("aria-controls");
+
+    if (!id) return [];
+
+    const listbox =
+      document.getElementById(id) ||
+      document.querySelector(`#${CSS.escape(id)}`);
+
+    if (!listbox) return [];
+
+    // The container may be the listbox itself or a wrapper around it.
+    return Array.from(
+      listbox.querySelectorAll('[role="option"], [role="menuitemradio"]')
+    ).filter(
+      (o) =>
+        o.getAttribute("aria-selected") !== "true" &&
+        o.getAttribute("data-automation-id") !== "selectedItem"
+    );
+  }
+
+
+  // Many component libraries keep every option in the DOM while their menu is
+  // closed, merely hiding it with CSS. Treating those hidden nodes as options
+  // that were already open makes a freshly opened menu look empty after the
+  // `before` filter in fillCombobox().
+  function isVisibleOption(el) {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      rect.width > 0 &&
+      rect.height > 0
+    );
+  }
+
+
+  function waitForOptions(timeoutMs) {
+    return new Promise((resolve) => {
+      const deadline = Date.now() + timeoutMs;
+
+      // Check once immediately — the popup may already have been open
+      // (or render synchronously), and there is no reason to make the
+      // user wait a full poll interval for nothing.
+      const existing = openOptions().filter(isVisibleOption);
+
+      if (existing.length) {
+        resolve(existing);
+        return;
+      }
+
+      const tick = () => {
+        const found = openOptions().filter(isVisibleOption);
+
+        if (found.length) {
+          resolve(found);
+          return;
+        }
+
+        if (Date.now() >= deadline) {
+          resolve([]);
+          return;
+        }
+
+        setTimeout(tick, OPTION_POLL_MS);
+      };
+
+      tick();
+    });
+  }
+
+
+  // ==========================================================
+  // FIND THE OPTION THAT MATCHES AN ANSWER
+  // ==========================================================
+  //
+  // Matching is done on the option's *text*, because that is what the
+  // user reads in the popup and what the answer in profile.json
+  // spells out.
+  //
+  // Three passes, most precise first:
+  //
+  //   1. exact match          "Yes"      vs "Yes"
+  //   2. startsWith           "Yes"      vs "Yes, I am willing"
+  //   3. contains             "authorized" vs "Yes — authorized to work"
+  //
+  // Exact must win over contains, otherwise the first option that
+  // merely mentions "No" ("No, I do not require sponsorship") could
+  // be picked for an answer of "Yes".
+  //
+  function matchOption(options, wantedTexts) {
+    // Every text this answer is allowed to match: the displayed value
+    // plus any aliases the profile listed alongside it (see `accepts` in
+    // matcher.js — this is how one answer covers both a "Yes"/"No"
+    // dropdown and a select whose option literally reads "Authorized to
+    // work").
+    const targets = (Array.isArray(wantedTexts) ? wantedTexts : [wantedTexts])
+      .map((t) => String(t ?? "").trim().toLowerCase())
+      .filter(Boolean);
+
+    if (!targets.length) {
+      return null;
+    }
+
+    const texts = options.map((o) => textOf(o).toLowerCase());
+
+    // Pass 1: exact, across all accepted texts. A full sweep of every
+    // alias is done before falling back to a looser rule for any of
+    // them, so an exact "No" is never beaten by a "No, not currently"
+    // that happens to come earlier in the list.
+    for (const pass of [
+      (t, target) => t === target,
+      (t, target) => t.startsWith(target),
+      (t, target) => t.includes(target)
+    ]) {
+      for (const target of targets) {
+        const hit = texts.findIndex((t) => pass(t, target));
+        if (hit !== -1) return options[hit];
+      }
+    }
+
+    return null;
+  }
+
+
+  // ==========================================================
+  // FILL A CUSTOM DROPDOWN / COMBOBOX
+  // ==========================================================
+  //
+  // Reproduces what a human does, in order:
+  //
+  //   1. click the trigger ("Select One")
+  //   2. wait for the popup to render its [role="option"] list
+  //   3. click the option whose text matches the answer
+  //
+  // The click in step 3 is what makes Workday update its internal
+  // form state — there is no way to shortcut that from script.
+  //
+  // The text box that filters this widget's option list, when it has one.
+  //
+  // Some dropdowns are searched rather than scanned. Workday's Field of Study
+  // is one: a "Search" box beside a magnifier icon, over a list of 323 entries
+  // rendered through a virtual scroller, so only a window of them exists in the
+  // DOM at any moment. An answer outside that window cannot be clicked, and no
+  // amount of waiting will bring it in — the list has to be filtered first.
+  //
+  // Two shapes are covered: the control *is* the search box (react-select's
+  // <input role="combobox">, Workday's selectinput), or the widget keeps one
+  // beside a styled trigger.
+  //
+  function comboSearchBox(el) {
+
+    if (el.tagName === "INPUT") {
+      return el;
+    }
+
+    const container = el.closest(
+      '[data-automation-id="multiSelectContainer"],' +
+        '[data-uxi-widget-type="multiselect"],' +
+        '[data-automation-id="multiselectInputContainer"],' +
+        '[role="listbox"]'
+    );
+
+    if (!container) {
+      return null;
+    }
+
+
+    // Workday renders a dropdown's current value in a sibling <input> that
+    // holds an internal ID (see isDropdownStateMirror). Writing an answer into
+    // that would replace the ID and break the widget without selecting
+    // anything, so those inputs are stepped over rather than accepted — and
+    // stepped over rather than treated as "no search box", because the real one
+    // is usually the very next candidate. Returning null here is what made a
+    // searchable widget silently fall back to opening a menu nobody could
+    // select from.
+    const candidates = container.querySelectorAll(
+      '[data-automation-id="searchBox"], input[type="text"], input:not([type]), input[type="search"]'
+    );
+
+    for (const candidate of candidates) {
+      if (!isDropdownStateMirror(candidate)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+
+  // The row to click for a matched option.
+  //
+  // Option text often sits in a nested element, and the click handler belongs
+  // to the row above it:
+  //
+  // <div data-automation-id="menuItem" role="option">
+  //   <div data-automation-label="Computer Engineering">Computer Engineering</div>
+  // </div>
+  //
+  // Both are matched by the option selectors (role, and Workday's
+  // data-automation-id), so the match can land on either. Clicking the row is
+  // what actually commits the choice.
+  //
+  // Presses Enter on an element, the way a person finishes typing an answer.
+  //
+  // Searchable dropdowns commit on this key: typing "Computer Engineering" into
+  // Workday's Field of Study and pressing Enter selects it, with no click on
+  // the row involved. That is the path the widget actually implements, so it is
+  // the one to drive — a synthesized click can land on the row and be ignored,
+  // while the key sequence goes through the same handler a real keystroke does.
+  //
+  // All three event types are dispatched because widgets disagree about which
+  // one they listen on, and Enter is harmless if handled twice.
+  function pressEnter(el) {
+    if (typeof el.focus === "function") {
+      el.focus();
+    }
+
+    for (const type of ["keydown", "keypress", "keyup"]) {
+      el.dispatchEvent(
+        new KeyboardEvent(type, {
+          key: "Enter",
+          code: "Enter",
+          keyCode: 13,
+          charCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true
+        })
+      );
+    }
+  }
+
+
+  function clickableOption(el) {
+    return (
+      el.closest(
+        '[role="option"], [role="menuitemradio"],' +
+          ' [role="menuitemcheckbox"], [role="menuitem"]'
+      ) || el
+    );
+  }
+
+
+  // Types `text` into an input one character at a time, the way a person does.
+  //
+  // nativeSetValue is wrong for a search box. It sets the value in one go and
+  // announces it with `input` and `change` only, which is right for filling a
+  // text field but useless for a box that filters as you type: a widget
+  // listening on keyup or keypress never hears a keystroke, so the list is
+  // still unfiltered when the fill goes on to read it. On Workday's Field of
+  // Study that meant the menu opened and then nothing could be selected from
+  // it.
+  //
+  // The value is still advanced through the native setter, one character per
+  // event, because a controlled React input only believes a change it was told
+  // about — and each `input` event carries the value up to that character, so a
+  // handler reading event.target.value sees the string grow as it types.
+  function typeIntoBox(el, text) {
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype,
+      "value"
+    ).set;
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+
+      // Order matters and mirrors a real keystroke: the key goes down carrying
+      // the value as it was *before* the character, the character lands, then
+      // the key comes back up with the value updated. A widget that filters on
+      // keyup therefore sees the new text, and one that filters on keydown sees
+      // the old — both exactly as they would from a person typing.
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: ch,
+          bubbles: true,
+          cancelable: true
+        })
+      );
+
+      setter.call(el, text.slice(0, i + 1));
+
+      el.dispatchEvent(
+        new KeyboardEvent("keypress", {
+          key: ch,
+          bubbles: true,
+          cancelable: true
+        })
+      );
+
+      // InputEvent rather than Event so a handler reading `data` sees the
+      // character, matching a real keystroke.
+      el.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          data: ch,
+          inputType: "insertText"
+        })
+      );
+
+      el.dispatchEvent(
+        new KeyboardEvent("keyup", {
+          key: ch,
+          bubbles: true,
+          cancelable: true
+        })
+      );
+    }
+  }
+
+
+  async function fillCombobox(el, wantedTexts) {
+    // Every text this answer is allowed to match: the displayed value
+    // plus any aliases from the profile (see `accepts` in matcher.js).
+    const wanted = (Array.isArray(wantedTexts) ? wantedTexts : [wantedTexts])
+      .map((t) => String(t ?? "").trim())
+      .filter(Boolean);
+
+    // What the page actually did, step by step, folded into the failure
+    // message.
+    //
+    // Dropdowns fail silently in several quite different ways — the keystrokes
+    // are ignored, the list filters to something else, Enter commits the
+    // highlighted row instead, the click lands on a row that cannot be chosen —
+    // and they all look identical from the popup: "not selected". Reporting
+    // what was observed at each step is the only thing that distinguishes them,
+    // and guessing between them costs the user a reload per attempt.
+    const trace = [];
+
+    const note = (step) => trace.push(step);
+
+    const fail = (reason) => ({
+      ok: false,
+      reason: reason + (trace.length ? ` [${trace.join("; ")}]` : "")
+    });
+
+    // Don't click the page around if we have nothing to select.
+    if (!wanted.length) {
+      return {
+        ok: false,
+        reason: "empty value"
+      };
+    }
+
+    // Options that were already on the page before we clicked, so we
+    // can tell "the popup opened" apart from "some other widget on
+    // this page happens to have an open listbox".
+    const before = new Set(openOptions().filter(isVisibleOption));
+
+
+    // Whether this trigger's menu is already open — because the user opened
+    // it, or because an earlier fill attempt failed and left it that way.
+    const wasOpen = el.getAttribute("aria-expanded") === "true";
+
+
+    // Reads this widget's options, preferring its own menu so two open
+    // dropdowns can't answer for each other.
+    const readWidgetOptions = () => {
+      const scopedToWidget = widgetMenuOptions(el);
+
+      return (scopedToWidget === null
+        ? openOptions()
+        : scopedToWidget
+      ).filter(isVisibleOption);
+    };
+
+
+    // What the list looked like before we typed anything. A searchable menu is
+    // shown in full when it opens — 323 rows on Workday — so this is what an
+    // ignored keystroke looks like, and the only way to tell it apart from a
+    // successful filter.
+    const fingerprintBefore = optionFingerprint(readWidgetOptions());
+
+
+    // Searchable dropdowns are narrowed by typing the answer, not by reading a
+    // list that may not even contain it yet.
+    //
+    // Only for a single answer, though: a multi-value field (Skills is a list
+    // of twenty) has to add its entries one at a time, and typing the whole
+    // comma-joined string into the box would filter to nothing and leave junk
+    // text behind for the user to clear.
+    const searchBox =
+      wanted.length === 1 && !wanted[0].includes(",")
+        ? comboSearchBox(el)
+        : null;
+
+    // The single most useful fact about a search box: did the page keep what we
+    // typed? React discards a value it does not accept, so an empty box
+    // afterwards means the keystrokes were rejected outright.
+    const reportTyped = () => {
+      if (!searchBox) {
+        return;
+      }
+
+      const held = searchBox.value;
+      const label = searchBox.getAttribute("data-automation-id") || searchBox.id || "input";
+
+      note(
+        held === wanted[0]
+          ? `box ${label} kept "${held}"`
+          : `box ${label} holds "${held}" instead of "${wanted[0]}"`
+      );
+    };
+
+
+    // 1. Put the widget in a state where its options can be read.
+    if (searchBox) {
+
+      // Focus first: some widgets mount their menu on focus rather than on
+      // click, and the box must be focused for the typed value to register.
+      if (typeof searchBox.focus === "function") {
+        searchBox.focus();
+      }
+
+      // Workday hides the real input behind a magnifier icon and only mounts
+      // the menu when that icon is used, so drive the icon when there is one.
+      const icon = searchBox.parentElement &&
+        searchBox.parentElement.querySelector(
+          '[data-automation-id="promptSearchButton"],' +
+            '[data-uxi-selectinputicon-type="promptSearchButton"]'
+        );
+
+      if (icon) {
+        humanClick(icon);
+      }
+
+      typeIntoBox(searchBox, wanted[0]);
+    } else if (!wasOpen) {
+
+      // Plain trigger button: never click an already-expanded one, that would
+      // close the menu we are about to read from.
+      humanClick(el);
+    }
+
+
+    // 2. Wait for the option list to be rendered.
+    const visible = (await waitForOptions(OPTION_WAIT_MS))
+      .filter(isVisibleOption);
+
+
+    // Prefer this trigger's own menu. Two dropdowns are open at once on a
+    // Workday application form (Degree and Field of Study), and a document-wide
+    // search would let one field's fill pick another field's option.
+    const scoped = triggerOptions(el).filter(isVisibleOption);
+
+    if (scoped.length || searchBox) {
+
+      if (searchBox) {
+        note(
+          searchBox.getAttribute("data-automation-id") === "searchBox"
+            ? "typed into searchBox"
+            : "typed into a plain input"
+        );
+        reportTyped();
+
+        const nowOpen = readWidgetOptions();
+        note(`list ${nowOpen.length} rows before filter`);
+
+        if (!nowOpen.length) {
+          note("no rows rendered");
+        }
+      }
+
+      const settled = searchBox
+        ? await waitForFilter(
+            readWidgetOptions,
+            wanted,
+            OPTION_WAIT_MS,
+            fingerprintBefore
+          )
+        : null;
+
+      if (settled) {
+        reportTyped();
+        note(`list ${settled.options.length} rows after filter`);
+        note(settled.filtered ? "list changed" : "list did not change");
+
+        const top = settled.options.slice(0, 3).map((o) => textOf(o).trim());
+
+        if (top.length) {
+          note(`top rows: ${top.join(" / ")}`);
+        }
+      }
+
+      if (settled && !settled.filtered) {
+        return fail(
+          `typed "${wanted[0]}" but the list did not filter, so Enter was not pressed`
+        );
+      }
+
+      return pickOption(
+        el,
+        settled ? settled.options : scoped,
+        wanted,
+        searchBox,
+        null,
+        note
+      );
+    }
+
+
+    // Options that appeared *because of our click* are the ones that belong to
+    // this trigger, which keeps a listbox some other widget left open on the
+    // page from being mistaken for this field's menu.
+    //
+    // When the menu was already open nothing is new, so fall back to everything
+    // visible rather than reporting a false "no options appeared" — that
+    // fallback is the whole reason this field used to stay unfilled after a
+    // single failed attempt.
+    const opened =
+      visible.filter((o) => !before.has(o));
+
+    const options = opened.length ? opened : visible;
+
+
+    // Nothing appeared — the trigger didn't open anything.
+    if (!options.length) {
+      return {
+        ok: false,
+        reason: wasOpen
+          ? "trigger reported itself open but no options are visible"
+          : "no options appeared after clicking"
+      };
+    }
+
+    return pickOption(el, options, wanted, searchBox, null, note);
+  }
+
+
+  // A comparable snapshot of the options currently rendered.
+//
+// Used to tell "the widget filtered what we typed" from "the widget ignored it
+// and is still showing everything". The distinction decides whether Enter is
+// safe to press, so it has to be read off the list rather than assumed.
+function optionFingerprint(options) {
+    return options.map((o) => textOf(o).trim()).join("");
+  }
+
+
+  // The options belonging to one particular widget's menu.
+  //
+  // Workday renders this menu as a popper appended to <body>, not inside the
+  // widget, and the search input carries no aria-controls for triggerOptions() to
+  // follow. It does, however, name the widget it belongs to
+  // (data-uxi-multiselect-id), and the popper names the widget it is showing
+  // (data-associated-widget) — so the pairing is enough to keep two open menus
+  // on the same form from answering for each other.
+  //
+  // Returns null when the page doesn't use this arrangement, so the caller can
+  // fall back to the document-wide search.
+  function widgetMenuOptions(el) {
+    const widgetId =
+      el.getAttribute("data-uxi-multiselect-id") ||
+      (el.closest("[data-uxi-element-id]") || {}).getAttribute?.(
+        "data-uxi-element-id"
+      );
+
+    if (!widgetId) {
+      return null;
+    }
+
+    const menus = document.querySelectorAll(
+      `[data-associated-widget="${CSS.escape(widgetId)}"]`
+    );
+
+    if (!menus.length) {
+      return null;
+    }
+
+    return openOptions().filter((o) =>
+      Array.from(menus).some(
+        (menu) => menu === o || menu.contains(o)
+      )
+    );
+  }
+
+
+  // Waits until the list reflects what was typed, then matches against it.
+  //
+  // Requiring the list to have *changed* is the load-bearing part. An unfiltered
+  // Workday menu already contains the answer somewhere among 323 rows, so
+  // finding the text proves nothing — and pressing Enter there commits whatever
+  // the widget has highlighted instead. On Workday that is the first row of the
+  // list, which is what aria-activedescendant points at, so an unfiltered Enter
+  // would silently fill "Accounting" into a Field of Study box.
+  //
+  // Returns `filtered: false` when the list never changed, and the caller must
+  // not press Enter in that case.
+  async function waitForFilter(readOptions, wanted, timeoutMs, fingerprintBefore) {
+    const deadline = Date.now() + timeoutMs;
+
+    let newest = [];
+
+    for (;;) {
+      const options = readOptions();
+
+      if (options.length) {
+        newest = options;
+      }
+
+      const fingerprint = optionFingerprint(options);
+
+      if (
+        options.length &&
+        fingerprint !== fingerprintBefore &&
+        matchOption(options, wanted)
+      ) {
+        return {
+          options,
+          filtered: true
+        };
+      }
+
+      if (Date.now() >= deadline) {
+        return {
+          options: newest,
+          filtered: fingerprint !== fingerprintBefore
+        };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, OPTION_POLL_MS));
+    }
+  }
+
+
+  // Choose one of `options` for `wanted` and commit it, closing the menu again
+  // if nothing matched.
+  //
+  // `enterBox` is the widget's search box when it has one. Committing a
+  // searchable dropdown the way a person does — Enter, no click — is tried
+  // first, because that is the path the widget actually implements; a
+  // synthesized click on the row can be ignored by the same widget.
+  //
+  // `target` is the row already matched against the settled list, when the
+  // caller waited for the list to filter. Matching it again here could pick a
+  // different row out of a list the caller has already moved past.
+  async function pickOption(el, options, wanted, enterBox, target, trace) {
+
+    const note = trace || (() => {});
+
+    target = target || matchOption(options, wanted);
+
+    if (!target) {
+      // Close the popup we opened so we don't leave the page in a
+      // half-interacted state.
+      humanClick(el);
+
+      return {
+        ok: false,
+        // Surfacing what *was* on offer is what makes this
+        // debuggable — without it the popup would just report
+        // "no matching option" and tell you nothing.
+        reason: `no option matching "${wanted.join(" / ")}" (saw: ${
+          options
+            .map((o) => textOf(o))
+            .slice(0, 8)
+            .join(" | ") || "none"
+        })`
+      };
+    }
+
+    // Workday's list rows wrap the real control — a radio in the Degree
+    // list, a checkbox in a multiselect — and the selection can be driven by
+    // that input's change handler rather than the row's click handler.
+    const row = clickableOption(target);
+
+    // What the widget has highlighted right now is what Enter will commit, and
+    // it is not necessarily the row we matched.
+    if (enterBox) {
+      const listbox = row.closest('[role="listbox"]');
+      const activeId = listbox && listbox.getAttribute("aria-activedescendant");
+      const active = activeId && document.getElementById(activeId);
+
+      note(
+        active
+          ? `Enter would commit "${textOf(active).trim()}"`
+          : "Enter has no aria-activedescendant to commit"
+      );
+
+      pressEnter(enterBox);
+
+      const took = await selectionTook(row, OPTION_SETTLE_MS);
+
+      note(took ? "Enter selected it" : "Enter changed nothing");
+
+      if (took) {
+        return {
+          ok: true
+        };
+      }
+
+      if (active && active !== row) {
+        note(
+          `widget instead highlighted "${textOf(active).trim()}" — clicking our row directly`
+        );
+      }
+    }
+
+    note(`clicking "${textOf(target).trim()}"`);
+
+    humanClick(row);
+
+    if (!(await selectionTook(row, OPTION_SETTLE_MS))) {
+      const control = row.querySelector(
+        'input[type="radio"], input[type="checkbox"]'
+      );
+
+      if (control) {
+        note("clicking the row's own input");
+        humanClick(control);
+      } else {
+        note("the row has no input to click");
+      }
+    }
+
+    if (!(await selectionTook(row, OPTION_SETTLE_MS))) {
+      return {
+        ok: false,
+        // Distinct from "no matching option" on purpose: the option was
+        // there and was clicked, so the problem is in how the widget accepts a
+        // selection, and saying otherwise would send the debugging in the wrong
+        // direction.
+        reason: `clicked "${textOf(target).trim()}" but the option was not marked selected`
+      };
+    }
+
+    return {
+      ok: true
+    };
+  }
+
+
+  // Some platforms render hierarchical multiselects: choosing a parent opens
+  // another menu containing its child. A normal combobox fill stops after the
+  // first click, so use a `Parent > Child` profile value to walk each level.
+  function isConfiguredHierarchicalMultiSelect(el, item) {
+    const config = platformConfig.hierarchicalMultiSelect;
+    return !!(
+      config &&
+      item.matchedPath === config.fieldPath &&
+      el.matches(config.inputSelector) &&
+      el.closest(config.containerSelector)
+    );
+  }
+
+
+  function hierarchicalMenuItems(config) {
+    return Array.from(
+      document.querySelectorAll(config.menuItemSelectors.join(", "))
+    ).filter((item) => {
+      if (!isVisibleOption(item)) return false;
+      // A selected pill also has role="option"/menuItem, but it is not a
+      // navigable menu choice and must not be selected again.
+      return !item.closest(config.selectedListSelector);
+    });
+  }
+
+
+  function selectedHierarchicalValues(el, config) {
+    const container = el.closest(config.containerSelector);
+    if (!container) return [];
+    return Array.from(container.querySelectorAll(config.selectedItemSelector))
+      .map(textOf)
+      .filter(Boolean);
+  }
+
+
+  function waitForHierarchicalOption(label, config, timeoutMs) {
+    return new Promise((resolve) => {
+      const deadline = Date.now() + timeoutMs;
+
+      const tick = () => {
+        const option = matchOption(hierarchicalMenuItems(config), [label]);
+        if (option) {
+          resolve(option);
+          return;
+        }
+        if (Date.now() >= deadline) {
+          resolve(null);
+          return;
+        }
+        setTimeout(tick, OPTION_POLL_MS);
+      };
+
+      tick();
+    });
+  }
+
+
+  async function fillHierarchicalMultiSelect(el, pathValue, config) {
+    const path = String(pathValue ?? "")
+      .split(/\s*>\s*/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+
+    if (!path.length) return { ok: false, reason: "empty value" };
+
+    const finalValue = path[path.length - 1].toLowerCase();
+    if (selectedHierarchicalValues(el, config).some((value) => value.toLowerCase() === finalValue)) {
+      return { ok: true };
+    }
+
+    humanClick(el);
+
+    for (const segment of path) {
+      const option = await waitForHierarchicalOption(segment, config, OPTION_WAIT_MS);
+      if (!option) {
+        return { ok: false, reason: `no menu option matching "${segment}"` };
+      }
+      humanClick(option);
+    }
+
+    // The last click schedules a React state update. Wait briefly for the
+    // selected pill so the report reflects Workday's actual state, not only a
+    // successful click dispatch.
+    const deadline = Date.now() + OPTION_WAIT_MS;
+    while (Date.now() < deadline) {
+      if (selectedHierarchicalValues(el, config).some((value) => value.toLowerCase() === finalValue)) {
+        return { ok: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, OPTION_POLL_MS));
+    }
+
+    return { ok: false, reason: `the menu did not select "${path[path.length - 1]}"` };
+  }
+
+
   const report = [];
 
 
   // Process every requested field.
-  payload.forEach((item) => {
+  //
+  // Sequential and awaited, not forEach: a combobox needs its popup
+  // opened, rendered and closed before the next field is touched,
+  // otherwise two open popups can sit on top of each other and the
+  // second fill clicks the wrong list.
+  //
+  for (const item of payload) {
 
     // Don't attempt to fill empty values.
     if (!item.value) {
@@ -1403,7 +3808,7 @@ function fillFormFields(payload) {
         reason: "empty value"
       });
 
-      return;
+      continue;
     }
 
 
@@ -1422,61 +3827,119 @@ function fillFormFields(payload) {
         )
       );
 
-
-      // Find the option whose:
-      //
-      // 1. value exactly matches the requested value
-      //
-      // OR
-      //
-      // 2. text next to the element contains the requested value
-      //
-      const target = group.find(
-        (g) =>
-          g.value
-            .toLowerCase() ===
-            item.value
-              .toLowerCase()
-          ||
-          (
-            g.nextSibling?.textContent || ""
-          )
-            .toLowerCase()
-            .includes(
-              item.value.toLowerCase()
-            )
-      );
-
-
-      // If a matching option was found...
-      if (target) {
-
-        // Check/select it.
-        setChecked(
-          target,
-          true
-        );
-
-
-        // Report success.
+      if (!group.length) {
         report.push({
           uid: item.uid,
-          ok: true
+          ok: false,
+          reason: "group options not found"
         });
+        continue;
+      }
 
-      } else {
 
-        // No matching option.
+      // Every string this option could legitimately be matched by. Native
+      // inputs expose `.value`; ARIA options are <div>s that only carry
+      // data-value/aria-label, and their visible text may sit in a nested
+      // span. Reading `.value` unguarded would throw on a div, so everything is
+      // funnelled through the null check.
+      const candidateTexts = (el) =>
+        [
+          el.value,
+          el.getAttribute("value"),
+          el.getAttribute("data-value"),
+          el.getAttribute("data-answer-value"),
+          el.getAttribute("aria-label"),
+          textOf(el)
+        ]
+          .map((candidate) => (candidate == null ? "" : String(candidate)).trim().toLowerCase())
+          .filter(Boolean);
+
+      const optionTexts = group.map(candidateTexts);
+
+
+      // A multi-select group carries values[]; a single-select one carries a
+      // single value plus its aliases. Applies the same alias list that select
+      // and combobox fields use — one ATS renders "Authorized to work" as a
+      // label while another renders the equivalent answer as a Yes/No group.
+      const wantsMultiple = item.multiple === true;
+      const wanted = (
+        wantsMultiple && Array.isArray(item.values) && item.values.length
+          ? item.values
+          : [item.value, ...(item.accepts || [])]
+      )
+        .map((value) => String(value ?? "").trim().toLowerCase())
+        .filter(Boolean);
+
+      if (!wanted.length) {
+        report.push({
+          uid: item.uid,
+          ok: false,
+          reason: "empty value"
+        });
+        continue;
+      }
+
+
+      // Exact matches across every option win before any looser pass, and each
+      // option is claimed at most once so two similar aliases can't both tick
+      // the same box.
+      const PREDICATES = [
+        (text, want) => text === want,
+        (text, want) => text.startsWith(want),
+        (text, want) => text.includes(want)
+      ];
+
+      const picked = [];
+      const taken = new Set();
+
+      for (const want of wanted) {
+        let foundIndex = -1;
+
+        for (const predicate of PREDICATES) {
+          const index = optionTexts.findIndex(
+            (texts, i) => !taken.has(i) && texts.some((text) => predicate(text, want))
+          );
+          if (index !== -1) {
+            foundIndex = index;
+            break;
+          }
+        }
+
+        if (foundIndex === -1) continue;
+
+        taken.add(foundIndex);
+        picked.push(group[foundIndex]);
+
+        // Radio options are mutually exclusive: the first match wins and the
+        // remaining candidates are discarded rather than fighting over the
+        // selection.
+        if (!wantsMultiple) break;
+      }
+
+
+      if (!picked.length) {
         report.push({
           uid: item.uid,
           ok: false,
           reason: "no matching option"
         });
+        continue;
       }
 
 
+      picked.forEach((el) => selectChoice(el));
+
+      report.push({
+        uid: item.uid,
+        ok: true,
+        // Multi-selects report how many boxes were ticked, so the UI can say
+        // "3 selected" instead of implying a single choice was made.
+        ...(picked.length > 1 ? { selected: picked.length } : {})
+      });
+
+
       // Group processing complete.
-      return;
+      continue;
     }
 
 
@@ -1500,7 +3963,35 @@ function fillFormFields(payload) {
         reason: "element not found"
       });
 
-      return;
+      continue;
+    }
+
+
+    // ========================================================
+    // CUSTOM DROPDOWN / COMBOBOX
+    // ========================================================
+    //
+    // Covers both flavours scanFormFields() can emit as a combobox:
+    //
+    //   tagName "combobox" -> a <button>/<div role="combobox"> trigger
+    //   tagName "input"    -> an <input role="combobox"> (react-select),
+    //                        which isComboboxLike() retyped during scan
+    //
+    // Neither accepts el.value = "Yes": the answer only reaches
+    // Workday's form state through a click on the chosen option.
+    //
+    if (item.inputType === "combobox") {
+      const result =
+        isConfiguredHierarchicalMultiSelect(el, item)
+          ? await fillHierarchicalMultiSelect(el, item.value, platformConfig.hierarchicalMultiSelect)
+          : await fillCombobox(el, [item.value, ...(item.accepts || [])]);
+
+      report.push({
+        uid: item.uid,
+        ...result
+      });
+
+      continue;
     }
 
 
@@ -1513,21 +4004,11 @@ function fillFormFields(payload) {
     //
     if (el.tagName === "SELECT") {
 
-      const opt = Array.from(
-        el.options
-      ).find(
-        (o) =>
-          o.textContent
-            .trim()
-            .toLowerCase() ===
-            item.value.toLowerCase()
-          ||
-          o.textContent
-            .trim()
-            .toLowerCase()
-            .includes(
-              item.value.toLowerCase()
-            )
+      // Same option matching the combobox path uses, so one answer list
+      // covers both control types (see matchOption above).
+      const opt = matchOption(
+        Array.from(el.options),
+        [item.value, ...(item.accepts || [])]
       );
 
 
@@ -1573,7 +4054,7 @@ function fillFormFields(payload) {
       }
 
 
-      return;
+      continue;
     }
 
 
@@ -1600,7 +4081,7 @@ function fillFormFields(payload) {
       });
 
 
-      return;
+      continue;
     }
 
 
@@ -1626,7 +4107,7 @@ function fillFormFields(payload) {
       uid: item.uid,
       ok: true
     });
-  });
+  }
 
 
   // Return the complete fill report.
@@ -2281,5 +4762,215 @@ function scanJobDescription() {
     text: "",
     source: "not found",
     truncated: false
+  };
+}
+
+
+// ============================================================
+// FILL RESUME BY DROP
+// ============================================================
+//
+// Second route for resume upload, for sites that build their file input on
+// demand instead of shipping one — Google Forms being the case that matters.
+//
+// Clicking its "Add file" button creates the <input type="file"> inside a
+// shadow root and opens the OS picker, so fillResumeFile() has nothing to
+// assign to and would report "element not found". But a Google Forms file
+// question is also a drop target: it renders a "Drop file here" state when a
+// file is dragged over it, and handles the file from the DataTransfer carried
+// on the drop event.
+//
+// So this dispatches dragenter/dragover/drop with a DataTransfer holding the
+// resume, rather than touching a file input. That needs no extra permission
+// and reuses the same base64 -> File conversion fillResumeFile() already does.
+//
+// Whether the page accepts an untrusted (script-generated) drop is the site's
+// decision, so success is never assumed: the result is verified against the
+// DOM afterwards and reported honestly either way.
+//
+// IMPORTANT: self-contained, like every function in this file — it is
+// serialized and injected on its own.
+// ============================================================
+
+async function fillResumeByDrop(
+  uid,
+  base64,
+  filename,
+  mimeType
+) {
+
+  const AUTOFILL_ATTR =
+    "data-autofill-uid";
+
+  const trigger =
+    document.querySelector(
+      `[${AUTOFILL_ATTR}="${uid}"]`
+    );
+
+  if (!trigger) {
+    return {
+      uid,
+      ok: false,
+      reason: "upload button not found — reload the page and scan again"
+    };
+  }
+
+
+  // --------------------------------------------------------
+  // BUILD THE FILE
+  // --------------------------------------------------------
+  //
+  let file = null;
+
+  try {
+    const byteChars =
+      atob(base64);
+
+    const byteNumbers =
+      new Array(byteChars.length);
+
+    for (
+      let i = 0;
+      i < byteChars.length;
+      i++
+    ) {
+      byteNumbers[i] =
+        byteChars.charCodeAt(i);
+    }
+
+    file = new File(
+      [new Uint8Array(byteNumbers)],
+      filename,
+      { type: mimeType }
+    );
+
+  } catch (err) {
+    return {
+      uid,
+      ok: false,
+      reason: `could not build the file from the saved PDF (${err.message})`
+    };
+  }
+
+
+  // --------------------------------------------------------
+  // DID A FILE LAND?
+  // --------------------------------------------------------
+  //
+  // Google shows accepted uploads as children of the question's
+  // role="list" container, so its emptiness is the honest signal that the drop
+  // was ignored. Checked before and after, because the file list may already
+  // hold something from an earlier manual upload.
+  //
+  const acceptedFiles = () => {
+    const question =
+      trigger.closest("[role='listitem']") ||
+      document;
+
+    const list =
+      question.querySelector(
+        "[role='list'][aria-label*='elected file']"
+      );
+
+    return list
+      ? list.children.length
+      : 0;
+  };
+
+  const filesBefore =
+    acceptedFiles();
+
+
+  // --------------------------------------------------------
+  // DISPATCH THE DRAG SEQUENCE
+  // --------------------------------------------------------
+  //
+  // dragenter and dragover must fire before drop: a drop handler that toggles
+  // its "Drop file here" state on dragover will otherwise ignore a drop event
+  // it never saw it enable.
+  //
+// Dispatched once, from the innermost element inside the upload question. Drag
+  // events bubble, so a drop on the button travels up through the card and the
+  // question and reaches every drop handler in between exactly once.
+  //
+  // Dispatching to each wrapper in turn instead would re-deliver the same drop
+  // to the same listeners, since each wrapper is an ancestor of the last — one
+  // resume, several uploads.
+  //
+  // Each event also needs its own DataTransfer. Drag and drop keeps one
+  // transfer per drag session, and that session ends at the drop, so sharing
+  // the object across all three leaves dragover with an empty file list — which
+  // is exactly what most handlers check before enabling the drop zone.
+  //
+  const makeTransfer = () => {
+    const dt =
+      new DataTransfer();
+
+    dt.items.add(file);
+
+    try {
+      dt.dropEffect = "copy";
+    } catch {
+      // Read-only in some contexts; the default still delivers files.
+    }
+
+    return dt;
+  };
+
+  try {
+    for (const type of ["dragenter", "dragover", "drop"]) {
+      trigger.dispatchEvent(
+        new DragEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          dataTransfer: makeTransfer()
+        })
+      );
+    }
+  } catch (err) {
+    return {
+      uid,
+      ok: false,
+      reason: `could not dispatch the drop event (${err.message})`
+    };
+  }
+
+
+  // --------------------------------------------------------
+  // VERIFY
+  // --------------------------------------------------------
+  //
+  // The upload is asynchronous — Google pushes the file to Drive before
+  // listing it — so this polls rather than checking once. Reporting "attached"
+  // without this is how the extension ends up claiming a resume it never
+  // uploaded.
+  //
+  const DEADLINE_MS = 6000;
+  const POLL_MS = 250;
+
+  const deadline =
+    Date.now() + DEADLINE_MS;
+
+  while (Date.now() < deadline) {
+    await new Promise(
+      (resolve) =>
+        setTimeout(resolve, POLL_MS)
+    );
+
+    if (acceptedFiles() > filesBefore) {
+      return {
+        uid,
+        ok: true,
+        method: "drop"
+      };
+    }
+  }
+
+
+  return {
+    uid,
+    ok: false,
+    reason:
+      "the page ignored the simulated drop — click \"Add file\" and choose the file yourself"
   };
 }

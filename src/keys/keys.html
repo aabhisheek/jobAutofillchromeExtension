@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>API Keys — Job Application Autofill</title>
+    <link rel="stylesheet" href="../lib/theme.css" />
+    <link rel="stylesheet" href="keys.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="mark"></span>
+          <span class="name">Job Application Autofill</span>
+        </div>
+        <a class="nav-item" href="../options/options.html">Profile</a>
+        <a class="nav-item" href="../dashboard/dashboard.html">Dashboard</a>
+        <a class="nav-item active" href="keys.html">API Keys</a>
+        <div class="sidebar-foot">
+          <div class="theme-switch" role="group" aria-label="Appearance">
+            <button type="button" data-theme-value="system">Auto</button>
+            <button type="button" data-theme-value="light">Light</button>
+            <button type="button" data-theme-value="dark">Dark</button>
+          </div>
+          <p class="sidebar-note">Keys stay in <span class="mono">chrome.storage.local</span> on this device.</p>
+        </div>      </aside>
+
+      <main class="main">
+        <div class="main-inner">
+          <div class="page-head">
+            <div>
+              <h1>AI Providers</h1>
+              <p class="sub">
+                Keys are used only to draft answers for questions your profile can't answer
+                directly, and only leave this browser on a request to the provider you picked.
+              </p>
+            </div>
+          </div>
+
+          <div class="card card-pad master">
+            <label class="checkbox-row">
+              <input type="checkbox" id="use-llm" />
+              <span>
+                Use an LLM to write drafts
+                <span class="muted small">
+                  — off means a local template fills free-text questions instead, with no network
+                  call and no key needed. Sponsorship, work authorization and EEO questions are
+                  never drafted by a model; they always come from your profile or are left for you.
+                </span>
+              </span>
+            </label>
+          </div>
+
+          <div id="providers" class="providers"></div>
+
+          <details class="card draft-extra" id="draft-extra">
+            <summary>Draft context</summary>
+            <div class="draft-extra-body">
+              <p class="muted small">
+                Standing notes sent with every AI draft — target roles, tone, domains. The long-form
+                file below is appended to it.
+              </p>
+              <label class="field-label" for="draft-context">Custom context and instructions</label>
+              <textarea id="draft-context" rows="4" placeholder="e.g. Backend / full-stack roles in Bangalore. Mention Go, Java and Spring Boot first. Concise, no buzzwords."></textarea>
+              <p class="muted small" id="context-file-status"></p>
+              <label class="field-label" for="context-file-preview">Context file (read-only preview)</label>
+              <textarea id="context-file-preview" class="mono" rows="6" readonly spellcheck="false" placeholder="Nothing loaded."></textarea>
+            </div>
+          </details>
+
+          <div class="actions-bar">
+            <button id="save" class="primary">Save</button>
+            <button id="reveal-all">Show all keys</button>
+            <button id="download">Download settings.json</button>
+            <button id="reload-bundled" class="ghost">Reload from bundled file</button>
+            <span id="status" class="status-msg"></span>
+          </div>
+
+          <p class="muted small footnote">
+            Saving asks Chrome for network access to each provider you filled in, and drops it again
+            for any you left blank — the extension never holds a permission it isn't using. To keep
+            keys across a wiped install, download the settings file and drop it over
+            <code>src/data/settings.json</code>; that file ships in cleartext inside the extension
+            folder, so keep it out of version control.
+          </p>
+        </div>
+      </main>
+    </div>
+
+    <script src="../lib/theme.js"></script>
+    <script src="../lib/schema.js"></script>
+    <script src="../lib/analytics.js"></script>
+    <script src="../lib/providers.js"></script>
+    <script src="keys.js"></script>
+  </body>
+</html>

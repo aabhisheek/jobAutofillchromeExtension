@@ -1,0 +1,221 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Applications — Job Application Autofill</title>
+    <link rel="stylesheet" href="../lib/theme.css" />
+    <link rel="stylesheet" href="dashboard.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="mark"></span>
+          <span class="name">Job Application Autofill</span>
+        </div>
+        <a class="nav-item" href="../options/options.html">Profile</a>
+        <a class="nav-item active" href="dashboard.html">Dashboard</a>
+        <a class="nav-item" href="../keys/keys.html">API Keys</a>
+        <div class="sidebar-foot">
+          <div class="theme-switch" role="group" aria-label="Appearance">
+            <button type="button" data-theme-value="system">Auto</button>
+            <button type="button" data-theme-value="light">Light</button>
+            <button type="button" data-theme-value="dark">Dark</button>
+          </div>
+          <p class="sidebar-note">Tracked locally in this browser. Nothing is submitted automatically.</p>
+        </div>      </aside>
+
+      <main class="main">
+        <div class="main-inner">
+          <div class="page-head">
+            <div>
+              <h1>Applications</h1>
+              <p class="sub">Every job you have saved or applied to, and how the pipeline is going.</p>
+            </div>
+            <div class="actions">
+              <button id="export-csv">Export CSV</button>
+              <button id="refresh">Refresh</button>
+              <button id="clear-all" class="ghost">Clear all</button>
+            </div>
+          </div>
+
+          <div id="notice" class="banner hidden"></div>
+
+          <div id="insights" class="insights"></div>
+
+          <details class="card add-panel" id="add-panel">
+            <summary>Add an application</summary>
+            <form id="add-form" class="add-form">
+              <div class="grid-2">
+                <div>
+                  <label class="field-label" for="add-title">Job title</label>
+                  <input type="text" id="add-title" placeholder="Associate Software Engineer" />
+                </div>
+                <div>
+                  <label class="field-label" for="add-company">Company</label>
+                  <input type="text" id="add-company" placeholder="Celonis" />
+                </div>
+              </div>
+              <div class="grid-2">
+                <div>
+                  <label class="field-label" for="add-url">Job URL</label>
+                  <input type="url" id="add-url" placeholder="https://…" />
+                </div>
+                <div>
+                  <label class="field-label" for="add-status">Status</label>
+                  <select id="add-status"></select>
+                </div>
+              </div>
+              <label class="field-label" for="add-notes">Notes</label>
+              <textarea id="add-notes" rows="2" placeholder="Recruiter name, referral code, follow-up date…"></textarea>
+              <div class="toolbar add-actions">
+                <button type="submit" class="primary">Add application</button>
+                <button type="button" id="add-cancel" class="ghost">Cancel</button>
+                <span id="add-status-msg" class="status-msg"></span>
+              </div>
+            </form>
+          </details>
+
+          <details class="card add-panel" id="mail-panel">
+            <summary>Import from Gmail</summary>
+            <div class="add-form">
+              <p class="panel-note">
+                Reads the confirmation emails every ATS already sends you and turns them into cards on
+                this board &mdash; so <strong>Applied this week</strong> counts jobs you did not have to
+                remember to track. Read-only access to your mail; nothing is ever sent or deleted.
+              </p>
+
+              <!-- Step 1: one-time Google Cloud setup. Shown until a client id
+                   exists, then collapsed out of the way. -->
+              <div id="mail-setup" class="mail-step hidden">
+                <h3 class="step-title">One-time setup</h3>
+                <ol class="setup-steps">
+                  <li>
+                    Open
+                    <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Google Cloud credentials</a>
+                    and create an OAuth client of type
+                    <strong>Chrome Extension</strong>. Copy the <em>Client ID</em> (it ends
+                    <code>apps.googleusercontent.com</code>).
+                  </li>
+                  <li>
+                    Paste that Client ID below. It is a public identifier, not a secret &mdash;
+                    there is nothing to protect and no client secret to store.
+                  </li>
+                  <li>
+                    In the same Google Cloud project, enable the
+                    <a href="https://console.cloud.google.com/apis/library/gmail.googleapis.com" target="_blank" rel="noreferrer">Gmail API</a>.
+                  </li>
+                </ol>
+                <label class="field-label" for="mail-client-id">Google OAuth Client ID</label>
+                <input
+                  type="text"
+                  id="mail-client-id"
+                  placeholder="1234567890-abc.apps.googleusercontent.com"
+                  spellcheck="false"
+                />
+                <p class="panel-hint">
+                  The redirect URI Google will ask for is fixed by this extension and is added
+                  automatically &mdash; there is nothing to register.
+                </p>
+                <div class="toolbar add-actions">
+                  <button type="button" id="mail-save-client" class="primary">Save client ID</button>
+                  <span id="mail-setup-msg" class="status-msg"></span>
+                </div>
+              </div>
+
+              <!-- Step 2: the consent grant. -->
+              <div class="mail-step">
+                <div class="conn-row">
+                  <span id="mail-conn-state" class="pill">Not connected</span>
+                  <span class="conn-actions">
+                    <button type="button" id="mail-connect" class="primary">Connect Gmail</button>
+                    <button type="button" id="mail-disconnect" class="ghost hidden">Disconnect</button>
+                  </span>
+                </div>
+                <p id="mail-conn-note" class="panel-hint">
+                  Grants read-only access to Gmail so confirmation emails can be read. You can revoke
+                  it from your Google account at any time.
+                </p>
+              </div>
+
+              <!-- Step 3: schedule + run. -->
+              <div class="mail-step">
+                <label class="check-row">
+                  <input type="checkbox" id="mail-enabled" />
+                  <span>
+                    <strong>Check my mail every day</strong>
+                    <span class="panel-hint">
+                      Runs in Chrome's own scheduler. Chrome only fires alarms while it is running, and
+                      a missed day is picked up by the next one.
+                    </span>
+                  </span>
+                </label>
+
+                <div class="grid-2 mail-grid">
+                  <div>
+                    <label class="field-label" for="mail-time">Daily at</label>
+                    <input type="time" id="mail-time" value="09:00" />
+                  </div>
+                  <div>
+                    <label class="field-label" for="mail-lookback">Look back</label>
+                    <select id="mail-lookback">
+                      <option value="7">Last 7 days</option>
+                      <option value="30">Last 30 days</option>
+                      <option value="90">Last 90 days</option>
+                    </select>
+                  </div>
+                </div>
+
+                <label class="field-label" for="mail-query">Gmail search</label>
+                <input type="text" id="mail-query" spellcheck="false" />
+                <p class="panel-hint">
+                  A normal Gmail search. The date filter is added for you, so you never have to write
+                  <code>newer_than:</code> yourself.
+                </p>
+
+                <label class="check-row">
+                  <input type="checkbox" id="mail-use-ai" />
+                  <span>
+                    <strong>Use AI to read the emails</strong>
+                    <span class="panel-hint">
+                      Sends the subject, sender and the first part of the body to the provider already
+                      configured in API Keys, to pull out the role and company. Off means a purely local
+                      parse, which is free and never leaves this machine.
+                    </span>
+                  </span>
+                </label>
+
+                <div class="toolbar add-actions">
+                  <button type="button" id="mail-save" class="primary">Save settings</button>
+                  <button type="button" id="mail-sync-now">Sync now</button>
+                  <button type="button" id="mail-reset" class="ghost">Re-import everything</button>
+                  <span id="mail-status-msg" class="status-msg"></span>
+                </div>
+                <p id="mail-last-run" class="panel-hint"></p>
+              </div>
+            </div>
+          </details>
+
+          <div id="board" class="board"></div>
+
+          <div id="empty" class="card empty hidden">
+            <p class="empty-title">Nothing tracked yet</p>
+            <p class="muted">
+              Open a job posting and press <strong>Track Job</strong> in the side panel, add one above, or
+              let <strong>Import from Gmail</strong> read the confirmation emails for you. Everything stays
+              in this browser.
+            </p>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script src="../lib/theme.js"></script>
+    <script src="../lib/schema.js"></script>
+    <script src="../lib/providers.js"></script>
+    <script src="../lib/tracker.js"></script>
+    <script src="../lib/gmail.js"></script>
+    <script src="../lib/mail-import.js"></script>
+    <script src="dashboard.js"></script>
+  </body>
+</html>

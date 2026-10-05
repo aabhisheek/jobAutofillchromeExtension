@@ -1,0 +1,418 @@
+/* Design tokens + app shell for the extension's full-page views (Profile /
+   Dashboard / API Keys).
+   ---------------------------------------------------------------------------
+   One file because all three screens have to look like one product.
+
+   Minimal by construction: no shadows anywhere, one accent colour, hairline
+   borders and two surface tints to carry all the structure. Colour is reserved
+   for state (active nav, primary action, validation) so that when it appears it
+   still means something.
+
+   Both themes are declared once via light-dark(), which resolves against the
+   element's used color-scheme. :root says `light dark`, so with no preference
+   set the OS decides; `[data-theme="light"]` / `[data-theme="dark"]` pin it and
+   win over the OS. See lib/theme.js. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: light-dark(#ffffff, #0f1115);
+  --bg-soft: light-dark(#f7f8fa, #161922);
+  --bg-card: light-dark(#ffffff, #1a1e28);
+  --bg-hover: light-dark(#f1f3f5, #232836);
+
+  --border: light-dark(#e6e8eb, #262b38);
+  --border-strong: light-dark(#d4d8dd, #3a4154);
+
+  --text: light-dark(#16181d, #e7eaf0);
+  --text-muted: light-dark(#5f6672, #9aa3b2);
+  --text-subtle: light-dark(#8b929e, #6b7383);
+
+  --accent: light-dark(#4f46e5, #818cf8);
+  --accent-hover: light-dark(#4338ca, #a5b0ff);
+  --accent-soft: light-dark(#eef2ff, rgba(129, 140, 248, 0.14));
+  --accent-border: light-dark(#c7d2fe, rgba(129, 140, 248, 0.32));
+  --on-accent: #ffffff;
+
+  --success: light-dark(#047857, #34d399);
+  --success-bg: light-dark(#ecfdf5, rgba(16, 185, 129, 0.12));
+  --success-border: light-dark(#a7f3d0, rgba(16, 185, 129, 0.36));
+  --warning: light-dark(#b45309, #fbbf24);
+  --warning-bg: light-dark(#fffbeb, rgba(251, 191, 36, 0.1));
+  --warning-border: light-dark(#fcd34d, rgba(251, 191, 36, 0.32));
+  --danger: light-dark(#b91c1c, #f87171);
+  --danger-bg: light-dark(#fef2f2, rgba(248, 113, 113, 0.12));
+  --danger-border: light-dark(#fecaca, rgba(248, 113, 113, 0.32));
+
+  /* Small radii on purpose. Large rounding reads as consumer-toy; 4/6/8 reads
+     as a tool. */
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 8px;
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --sidebar-w: 200px;
+}
+
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: var(--accent-soft); }
+
+/* ---- App shell ------------------------------------------------------ */
+
+.app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 20px 12px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 8px;
+  margin-bottom: 14px;
+}
+
+.brand .mark {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+}
+
+.brand .name {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--radius);
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.nav-item:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+/* Active is a tint plus weight, not a filled pill — the accent is reserved. */
+.nav-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sidebar-foot {
+  margin-top: auto;
+  padding-top: 14px;
+}
+
+/* The sidebar note is context, not controls; the appearance switch below it is
+   the only interactive thing down here. */
+.sidebar-note {
+  margin: 12px 0 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-subtle);
+}
+
+.theme-switch {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+
+.theme-switch button {
+  flex: 1;
+  height: 24px;
+  padding: 0 6px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.theme-switch button:hover { background: var(--bg-hover); color: var(--text); }
+
+.theme-switch button[aria-pressed="true"] {
+  background: var(--bg-hover);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.main {
+  min-width: 0;
+  padding: 28px 32px 56px;
+}
+
+.main-inner {
+  max-width: 1080px;
+}
+
+/* ---- Page header ---------------------------------------------------- */
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: 16px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.page-head h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.page-head .sub {
+  margin: 5px 0 0;
+  max-width: 68ch;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.page-head .actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
+}
+
+/* ---- Section heading ------------------------------------------------ */
+
+.section {
+  margin: 32px 0 14px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.section h2 {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.section .sub {
+  margin: 4px 0 0;
+  max-width: 76ch;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+/* ---- Primitives ----------------------------------------------------- */
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.card-pad { padding: 16px 18px; }
+
+h2 { font-size: 14px; font-weight: 600; }
+
+.muted { color: var(--text-muted); }
+.small { font-size: 12.5px; }
+.mono { font-family: var(--mono); }
+.hidden { display: none !important; }
+
+code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+}
+
+button {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+button:hover:not(:disabled) { background: var(--bg-hover); }
+button:disabled { opacity: 0.55; cursor: default; }
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+button.ghost {
+  background: none;
+  border-color: transparent;
+  color: var(--accent);
+}
+
+button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
+
+button.danger {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--bg-card);
+}
+
+button.danger:hover:not(:disabled) { background: var(--danger-bg); }
+
+input[type="text"],
+input[type="password"],
+input[type="url"],
+select,
+textarea {
+  width: 100%;
+  padding: 6px 9px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+textarea { resize: vertical; min-height: 76px; line-height: 1.55; }
+
+input::placeholder, textarea::placeholder { color: var(--text-subtle); }
+
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.field-label {
+  display: block;
+  margin: 12px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+
+.checkbox-row input { margin: 2px 0 0; accent-color: var(--accent); }
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-msg { font-size: 12.5px; color: var(--text-muted); }
+.status-msg.ok { color: var(--success); }
+.status-msg.warn { color: var(--warning); }
+.status-msg.err { color: var(--danger); }
+
+.banner {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  padding: 8px 12px;
+  font-size: 13px;
+  margin: 0 0 16px;
+}
+
+.banner.ok { color: var(--success); background: var(--success-bg); border-color: var(--success-border); }
+.banner.warn { color: var(--warning); background: var(--warning-bg); border-color: var(--warning-border); }
+.banner.err { color: var(--danger); background: var(--danger-bg); border-color: var(--danger-border); }
+
+/* ---- Responsive ----------------------------------------------------- */
+
+@media (max-width: 860px) {
+  .app { grid-template-columns: 1fr; }
+
+  .sidebar {
+    position: static;
+    height: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .brand { padding: 0 8px 0 4px; margin-bottom: 0; }
+  .sidebar-foot { margin: 0 0 0 auto; padding: 0; }
+  .sidebar-note { display: none; }
+  .theme-switch { width: auto; }
+  .main { padding: 20px 18px 48px; }
+  .page-head { flex-direction: column; gap: 14px; }
+}

@@ -28,6 +28,38 @@ code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; }
 }
 .pdf-attach-box .field-label { margin-top: 0; }
 
+/* Optional "compare against a different resume.tex" box. Collapsed by default so
+   it does not compete with the job description for attention. */
+.tex-source-box {
+  border: 1px solid #e5e7eb;
+  background: #f9fafb;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.tex-source-box summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.tex-source-box[open] summary { margin-bottom: 6px; }
+.tex-source-box .muted { margin: 4px 0 8px; }
+.tex-source-box .field-label { margin: 8px 0 4px; }
+.tex-source-box .toolbar { margin: 8px 0 0; }
+
+#tex-text-input {
+  width: 100%;
+  height: 130px;
+  font-size: 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  padding: 8px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
+}
+
 #jd-input {
   width: 100%;
   height: 140px;
@@ -85,6 +117,61 @@ button:hover { background: #ebebeb; }
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
+}
+
+/* Rendered A4 sheets. The width comes from the layout (paperWidthPx) and each
+   sheet is transform-scaled down so both columns fit side by side. */
+.pages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 10px;
+  min-height: 120px;
+}
+.pages iframe {
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  background: #fff;
+}
+.pages iframe.measuring {
+  position: absolute;
+  left: -10000px;
+  top: 0;
+  border: none;
+  visibility: hidden;
+}
+.pages .page-error { color: #b91c1c; font-size: 12px; }
+
+.seg {
+  display: inline-flex;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.seg button {
+  border: none;
+  border-radius: 0;
+  background: #f5f5f5;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+.seg button + button { border-left: 1px solid #ccc; }
+.seg button.active { background: #2563eb; color: #fff; font-weight: 600; }
+
+.field-label.inline {
+  display: inline;
+  margin: 0;
+}
+select {
+  font-size: 13px;
+  padding: 5px 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #fff;
 }
 
 .pane-label {

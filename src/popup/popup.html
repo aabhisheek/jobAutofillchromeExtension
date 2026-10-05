@@ -7,7 +7,15 @@
   </head>
   <body>
     <header>
-      <h1>Job Application Autofill</h1>
+      <div class="header-top">
+        <h1>Job Application Autofill</h1>
+        <button
+          id="minimize-btn"
+          class="icon-btn"
+          title="Minimize — closes this panel and keeps it hidden until you restore it"
+          aria-label="Minimize panel"
+        >–</button>
+      </div>
       <div id="profile-summary" class="muted">Loading profile…</div>
     </header>
 
@@ -17,8 +25,40 @@
     </div>
 
     <div id="main" class="hidden">
+      <div id="access-bar" class="hidden">
+        <span id="access-text" class="muted"></span>
+        <button id="access-btn" class="link-btn">How to fix</button>
+      </div>
       <button id="scan-btn">Scan Form</button>
+      <button id="resolve-btn" class="hidden">Resolve All with AI</button>
       <div id="scan-status" class="muted"></div>
+      <div id="diag-bar">
+        <button id="diag-btn" class="link-btn">Show Diagnostics</button>
+        <span id="diag-status" class="muted"></span>
+      </div>
+      <textarea id="diag-text" class="hidden" readonly rows="10" spellcheck="false"></textarea>
+
+      <details id="ai-context-container" class="ai-context-card">
+        <summary class="ai-context-header">
+          <span class="ai-context-title">✍️ AI Draft Context</span>
+          <span id="ai-context-badge" class="badge">optional</span>
+        </summary>
+        <div class="ai-context-body">
+          <label for="ai-context-text" class="ai-context-label">
+            Custom context / notes for AI (e.g. what you're looking for, goals, tone):
+          </label>
+          <textarea
+            id="ai-context-text"
+            placeholder="e.g. Looking for backend/fullstack roles in Bangalore, experienced with distributed systems, immediate joiner..."
+            rows="3"
+            spellcheck="false"
+          ></textarea>
+          <div class="ai-context-footer">
+            <span id="ai-context-status" class="muted"></span>
+          </div>
+          <div id="ai-context-file" class="muted"></div>
+        </div>
+      </details>
 
       <div id="field-list"></div>
 
@@ -30,14 +70,27 @@
 
     <footer>
       <button id="footer-options" class="link-btn">Edit Profile</button>
+      <button id="footer-track" class="link-btn">Track Job</button>
+      <button id="footer-dashboard" class="link-btn">Dashboard</button>
       <button id="footer-resume" class="link-btn">Tailor Resume for This Job</button>
       <span class="muted">Nothing is ever submitted automatically.</span>
     </footer>
 
+    <script src="../lib/theme.js"></script>
     <script src="../lib/schema.js"></script>
+    <script src="../lib/providers.js"></script>
+    <script src="../lib/tracker.js"></script>
     <script src="../lib/matcher.js"></script>
+    <script src="../lib/learned.js"></script>
     <script src="../lib/draft.js"></script>
     <script src="../lib/page-scripts.js"></script>
+    <script src="../lib/ats/generic.js"></script>
+    <script src="../lib/ats/workday.js"></script>
+    <script src="../lib/ats/linkedin.js"></script>
+    <script src="../lib/ats/greenhouse.js"></script>
+    <script src="../lib/ats/lever.js"></script>
+    <script src="../lib/ats/google-forms.js"></script>
+    <script src="../lib/ats/registry.js"></script>
     <script src="../lib/analytics.js"></script>
     <script src="popup.js"></script>
   </body>

@@ -103,58 +103,29 @@ function parseKeywordJSON(text) {
   return parsed.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim());
 }
 
-async function extractKeywordsGroq(jdText, settings) {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${settings.groqApiKey}` },
-    body: JSON.stringify({
-      model: settings.groqModel || "openai/gpt-oss-120b",
-      max_tokens: 500,
-      messages: [{ role: "user", content: buildKeywordPrompt(jdText) }]
-    })
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Groq request failed (${res.status}): ${text.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  if (!text) throw new Error("Groq response had no text content.");
-  return parseKeywordJSON(text);
+// Keyword extraction reuses the same provider catalog (and the same wire-format
+// senders) as draft.js, so whichever keys are configured on the API Keys screen
+// work here too — including Claude and the OpenAI-compatible vendors, which
+// previously had no path into resume tailoring at all.
+function extractKeywordsWith(provider, jdText, settings) {
+  return sendProviderPrompt({
+    provider,
+    settings,
+    prompt: buildKeywordPrompt(jdText),
+    maxTokens: 500
+  }).then(parseKeywordJSON);
 }
 
-async function extractKeywordsGemini(jdText, settings) {
-  const model = settings.geminiModel || "gemini-flash-latest";
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${settings.geminiApiKey}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ contents: [{ parts: [{ text: buildKeywordPrompt(jdText) }] }] })
-    }
-  );
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Gemini request failed (${res.status}): ${text.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-  const text = Array.isArray(parts) ? parts.map((p) => p.text || "").join("") : "";
-  if (!text) throw new Error("Gemini response had no text content.");
-  return parseKeywordJSON(text);
-}
-
-// Single entry point. Tries LLM (Groq, then Gemini) when settings.useLLM is
-// on and a key is present; always falls back to the local dictionary if the
-// LLM is off, unconfigured, or errors out — extraction never hard-fails.
+// Single entry point. Providers are tried cheapest-first, in the catalog's order
+// (free tiers ahead of paid ones). Always falls back to the local dictionary if
+// the LLM is off, unconfigured, or every provider errors out — extraction never
+// hard-fails.
 async function extractKeywords(jdText, profile, settings) {
   const localResult = extractKeywordsLocal(jdText, profile);
 
   if (!(settings && settings.useLLM)) return localResult;
 
-  const attempts = [];
-  if (settings.groqApiKey) attempts.push(() => extractKeywordsGroq(jdText, settings));
-  if (settings.geminiApiKey) attempts.push(() => extractKeywordsGemini(jdText, settings));
+  const attempts = configuredProviders(settings).map((provider) => () => extractKeywordsWith(provider, jdText, settings));
 
   for (const attempt of attempts) {
     try {
@@ -187,6 +158,11 @@ function analyzeMatch(jdKeywords, profile) {
 // ---- Tailoring: append a visible, ATS-scannable line of matched JD ----
 // terms that are true but not already literally worded in the resume.
 // Never touches Experience/Projects bullets, never adds unverified claims.
+
+// Shared so the Tailor page can highlight the exact block this inserts in both
+// the rendered preview and the source diff.
+const ADDED_KEYWORDS_LABEL = "Additional Relevant Keywords";
+
 function tailorResumeTex(resumeText, matched) {
   const alreadyPresent = new Set(matched.filter((kw) => containsPhrase(resumeText, kw)).map((k) => k.toLowerCase()));
   const toAdd = matched.filter((kw) => !alreadyPresent.has(kw.toLowerCase()));
@@ -195,7 +171,7 @@ function tailorResumeTex(resumeText, matched) {
     return { tailoredText: resumeText, addedKeywords: [] };
   }
 
-  const newLine = `\\textbf{Additional Relevant Keywords:} ${toAdd.join(", ")}`;
+  const newLine = `\\textbf{${ADDED_KEYWORDS_LABEL}:} ${toAdd.join(", ")}`;
   const skillsHeading = /\\section\*\{Technical Skills\}/;
 
   if (!skillsHeading.test(resumeText)) {

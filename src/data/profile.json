@@ -2,12 +2,15 @@
   "personal": {
     "firstName": "Abhishek",
     "lastName": "Anand",
+    "fullName": "Abhishek Anand",
     "email": "anand.abhisheek@gmail.com",
     "phone": "9650734826",
     "address": "Jp Nagar, Bengaluru",
     "city": "Bengaluru",
     "state": "Karnataka",
     "country": "India",
+    "citizenship": "Indian",
+    "dateOfBirth": "10-03-2002",
     "zip": "560078"
   },
   "links": {
@@ -17,7 +20,10 @@
   },
   "education": [
     {
-      "degree": "B.Tech",
+      "degree": [
+        "B.Tech",
+        "Bachelors"
+      ],
       "field": "Computer Science",
       "institution": "KIIT University",
       "startDate": "2021",
@@ -27,22 +33,40 @@
   ],
   "experience": [
     {
-      "company": "AuraCloud",
+      "company": "Aura Cloud",
       "title": "Software Engineer",
-      "startDate": "2025-08",
-      "endDate": "2026-08",
-      "current": false,
+      "startDate": "2025-07",
+      "endDate": "",
+      "current": true,
       "technologies": ["Node.js", "Express.js", "MongoDB", "JWT", "RBAC", "React", "Next.js"],
       "description": "Developed and maintained backend services and RESTful APIs using Node.js and Express.js. Designed database models and queries using MongoDB. Implemented authentication, authorization, and secure API access using JWT and RBAC. Integrated backend APIs with frontend applications built using React and Next.js. Worked on API validation, pagination, filtering, error handling, and performance improvements. Investigated and resolved production issues and bugs reported by QA and users. Collaborated with cross-functional teams using Git and Agile development practices."
     },
     {
-      "company": "Webnot Technologies",
+      "company": "Webknot Technologies",
       "title": "Software Engineer Intern",
-      "startDate": "2025-04",
-      "endDate": "2025-07",
+      "startDate": "2025-03",
+      "endDate": "2025-05",
       "current": false,
       "technologies": ["Node.js", "Express.js", "MongoDB", "Mongoose", "JWT", "React"],
       "description": "Developed RESTful APIs using Node.js and Express.js. Designed MongoDB schemas and implemented CRUD operations using Mongoose. Implemented authentication and authorization using JWT and role-based access control. Integrated backend APIs with React frontend components. Worked on API validation, pagination, filtering, and error handling. Assisted in debugging application issues and fixing QA-reported bugs."
+    },
+    {
+      "company": "Viztal Technologies",
+      "title": "",
+      "startDate": "2024-07",
+      "endDate": "2025-02",
+      "current": false,
+      "technologies": [],
+      "description": ""
+    },
+    {
+      "company": "KPIT Technologies",
+      "title": "",
+      "startDate": "2024-01",
+      "endDate": "2024-04",
+      "current": false,
+      "technologies": [],
+      "description": ""
     }
   ],
   "projects": [
@@ -86,10 +110,15 @@
     "expectedSalary": "9 LPA",
     "salaryExpectation": "9 LPA",
     "willingToRelocate": "Yes",
+    "previouslyEmployed": "",
+    "familyMembersAtCompany": "No",
+    "hasNonCompete": "No",
+    "restrictedCountryCitizenship": "No",
+    "otherCountryResidency": "No",
     "veteranStatus": "No",
     "disabilityStatus": "No",
     "gender": "Male",
     "race": "South Asian",
-    "howDidYouHear": "Company website"
+    "howDidYouHear": "Social Media > LinkedIn"
   }
 }

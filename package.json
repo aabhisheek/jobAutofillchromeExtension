@@ -1,0 +1,14 @@
+{
+  "name": "job-autofill-extension",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Job Application Autofill Chrome extension (Manifest V3, no build step).",
+  "scripts": {
+    "test": "node --test --test-reporter=spec tests/",
+    "test:watch": "node --test --watch tests/",
+    "test:ci": "node --test --test-reporter=spec tests/"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
