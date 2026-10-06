@@ -8,5 +8,10 @@ const GreenhouseAtsAdapter = {
       return false;
     }
   },
-  pageConfig: {}
+  pageConfig: {
+    // Greenhouse's post-application wizard is a single <button> in the card
+    // footer whose label changes per step ("Submit" on the last one). The shared
+    // engine already refuses to click a submit, so naming the footer is enough.
+    advanceButton: 'button[type="submit"][class*="btn" i], form button[type="submit"]'
+  }
 };

@@ -1,5 +1,6 @@
-// LinkedIn Easy Apply uses a multi-step modal. It currently uses the shared
-// HTML-control fallback; future modal-specific navigation belongs here.
+// LinkedIn Easy Apply uses a multi-step modal. Form fields use the shared
+// HTML-control fallback; navigation is where the modal differs from a full-page
+// wizard.
 const LinkedInAtsAdapter = {
   id: "linkedin",
   name: "LinkedIn Easy Apply",
@@ -10,5 +11,11 @@ const LinkedInAtsAdapter = {
       return false;
     }
   },
-  pageConfig: {}
+  pageConfig: {
+    // Easy Apply is a modal whose steps advance with a footer "Next" button and
+    // whose last step says "Submit". The shared engine's text matching handles
+    // both, and refuses the submit — which is the desired outcome here, since
+    // LinkedIn's submit is the real application.
+    advanceButton: '[data-id*="jobs-apply-next" i], form footer button[type="submit"]'
+  }
 };

@@ -29,9 +29,36 @@ const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 // Google's own OAuth guide calls this the "TVs and Limited Input devices" type.
 // It is a public client: there is no client secret to ship or protect, which is
 // the only reason this can be dependency-free and buildless.
+//
+// A client secret is still *accepted* when one is configured, because Google's
+// token endpoint asks for one on some client types. It is treated as a public
+// value, which is Google's own position for installed apps: "…which you embed in
+// the source code of your application. (In this context, the client secret is
+// obviously not treated as a secret.)" It is stored in chrome.storage.local and
+// never written into this repository, which is public.
 const TOKEN_TYPE = "urn:ietf:params:oauth:token-type:oauth2";
 const ACCESS_TYPE = "offline";
 const PROMPT = "consent";
+
+// PKCE (RFC 7636), S256. Binds the authorization code to this one request, so an
+// code intercepted in the redirect cannot be redeemed by anyone else. This is
+// what allows the flow to work without relying on the client secret at all.
+function base64UrlEncode(bytes) {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function randomVerifier() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncode(bytes);
+}
+
+async function challengeFor(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return base64UrlEncode(new Uint8Array(digest));
+}
 
 // Refresh this far out rather than at expiry, so a sync that starts at 08:59
 // does not discover at 09:00 that the token died mid-request.
@@ -61,12 +88,17 @@ function isConnected(auth) {
   return !!(auth && auth.refreshToken);
 }
 
-// Redirect URL for chrome.identity.launchWebAuthFlow. Derived from the
-// extension's own id, so it is stable across machines and needs no redirect URI
-// to be registered anywhere — which is the whole reason this path exists
-// instead of a packaged web app.
+// Redirect URL for chrome.identity.launchWebAuthFlow.
+//
+// Must be the BARE origin, no path. A Google Cloud OAuth client of type
+// "Chrome Extension" is configured with nothing but the extension id, and
+// Google then registers exactly `https://<id>.chromiumapp.org/` for it. Passing
+// a path argument here — `getRedirectURL("oauth2")` — appends a segment that
+// was never registered, and every consent attempt dies with
+// `Error 400: redirect_uri_mismatch` before the user ever sees a consent
+// screen. So: no argument.
 function redirectUrl() {
-  return chrome.identity.getRedirectURL("oauth2");
+  return chrome.identity.getRedirectURL();
 }
 
 // The two Google origins, which live in the manifest's optional permissions so
@@ -77,16 +109,25 @@ function requiredOrigins() {
 
 // ---- token lifecycle ---------------------------------------------------
 
-async function exchangeCodeForTokens(code, clientId) {
+async function exchangeCodeForTokens(code, clientId, clientSecret, codeVerifier) {
+  const body = new URLSearchParams({
+    code,
+    client_id: clientId,
+    grant_type: "authorization_code",
+    redirect_uri: redirectUrl()
+  });
+  // PKCE: proves this exchange belongs to the authorize request we started, so
+  // a code grabbed from the redirect cannot be redeemed by someone else.
+  if (codeVerifier) body.set("code_verifier", codeVerifier);
+  // Google's token endpoint answers `invalid_request: client_secret is missing`
+  // on Web-client ids, so it is sent when configured. See the note at the top
+  // of this file: for an installed app Google does not treat it as a secret.
+  if (clientSecret) body.set("client_secret", clientSecret);
+
   const res = await fetch(TOKEN_URL, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      code,
-      client_id: clientId,
-      grant_type: "authorization_code",
-      redirect_uri: redirectUrl()
-    })
+    body
   });
 
   if (!res.ok) {
@@ -106,15 +147,18 @@ async function exchangeCodeForTokens(code, clientId) {
   };
 }
 
-async function refreshAccessToken(auth, clientId) {
+async function refreshAccessToken(auth, clientId, clientSecret) {
+  const body = new URLSearchParams({
+    client_id: clientId,
+    refresh_token: auth.refreshToken,
+    grant_type: "refresh_token"
+  });
+  if (clientSecret) body.set("client_secret", clientSecret);
+
   const res = await fetch(TOKEN_URL, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: clientId,
-      refresh_token: auth.refreshToken,
-      grant_type: "refresh_token"
-    })
+    body
   });
 
   if (!res.ok) {
@@ -149,7 +193,19 @@ async function ensureAccessToken(settings) {
   if (!clientId) throw new Error("Add your Google OAuth client id before syncing.");
   if (!auth.refreshToken) throw new Error("Gmail needs reconnecting to get a refresh token.");
 
-  return refreshAccessToken(auth, clientId);
+  return refreshAccessToken(auth, clientId, String((settings && settings.gmailClientSecret) || "").trim());
+}
+
+// Single-use CSRF token for one consent attempt. Held in memory rather than
+// storage: `connect()` only ever runs from a live extension page, so the token
+// does not need to outlive the page, and keeping it out of storage means it
+// cannot be replayed from a stale value later.
+let pendingState = null;
+
+function newState() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // Opens Google's consent screen. Must be called from an extension page, and
@@ -162,6 +218,13 @@ async function connect({ settings, interactive = true } = {}) {
   const granted = await chrome.permissions.request({ origins: requiredOrigins() });
   if (!granted) throw new Error("Network access to Google was declined, so Gmail stays disconnected.");
 
+  const state = newState();
+  pendingState = state;
+
+  const clientSecret = String((settings && settings.gmailClientSecret) || "").trim();
+  const codeVerifier = randomVerifier();
+  const codeChallenge = await challengeFor(codeVerifier);
+
   // prompt=consent is what makes Google issue a refresh token the first time.
   // Without it a user who has already granted the scope silently gets no
   // refresh_token and the connection dies an hour later.
@@ -172,24 +235,57 @@ async function connect({ settings, interactive = true } = {}) {
     `&scope=${encodeURIComponent(GMAIL_SCOPE)}` +
     `&access_type=${ACCESS_TYPE}` +
     `&prompt=${PROMPT}` +
+    `&state=${state}` +
+    `&code_challenge=${encodeURIComponent(codeChallenge)}` +
+    `&code_challenge_method=S256` +
     `&include_granted_scopes=true`;
 
-  const responseUrl = await chrome.identity.launchWebAuthFlow({
-    url,
-    interactive: interactive !== false
-  });
+  let responseUrl;
+  try {
+    responseUrl = await chrome.identity.launchWebAuthFlow({
+      url,
+      interactive: interactive !== false
+    });
+  } catch (err) {
+    // A rejected redirect_uri never comes back to us: Google renders an error
+    // page inside the flow window instead of redirecting, so this promise only
+    // settles when the user closes that window. That is why the failure looks
+    // mute in the panel. Name the one cause worth checking.
+    throw new Error(
+      `Google closed the sign-in window without completing (${err && err.message ? err.message : "no detail"}). ` +
+      `If the window showed "Error 400: redirect_uri_mismatch", the client's Application ID in Google Cloud ` +
+      `is not this extension's ID (${chrome.runtime.id}).`
+    );
+  } finally {
+    pendingState = null;
+  }
 
   if (!responseUrl) throw new Error("Google sign-in was cancelled.");
 
-  // Google's redirect back to a Chrome extension arrives as
-  // chrome-extension://<id>/oauth2?state=…&code=…&scope=…
-  const code = new URL(responseUrl).searchParams.get("code");
-  if (!code) {
-    const err = new URL(responseUrl).searchParams.get("error");
-    throw new Error(err ? `Google returned "${err}".` : "Google's response had no authorization code.");
+  // Google redirects back to chrome-extension://<id>/?state=…&code=…, which
+  // chrome.identity hands to us instead of navigating to.
+  const returned = new URL(responseUrl);
+
+  // Google's own error is surfaced before the state check. The state check is
+  // there to stop a forged or replayed `code` being redeemed, so it guards the
+  // code path only; an `error` response mints nothing and its text comes from
+  // Google, not from an attacker. Reporting it first means a declined consent
+  // screen says "access denied" instead of the useless "state mismatch".
+  const error = returned.searchParams.get("error");
+  if (error) {
+    const description = returned.searchParams.get("error_description") || "";
+    throw new Error(`Google returned ${error}${description ? `: ${description}` : ""}.`);
   }
 
-  const auth = await exchangeCodeForTokens(code, clientId);
+  const returnedState = returned.searchParams.get("state");
+  if (!state || returnedState !== state) {
+    throw new Error("Google's reply did not match this sign-in attempt (state mismatch). Try connecting again.");
+  }
+
+  const code = returned.searchParams.get("code");
+  if (!code) throw new Error("Google's response had no authorization code.");
+
+  const auth = await exchangeCodeForTokens(code, clientId, clientSecret, codeVerifier);
   await writeAuth(auth);
   return getConnection(settings, auth);
 }
@@ -285,13 +381,42 @@ function headerValue(headers, name) {
   return match ? String(match.value || "") : "";
 }
 
+// Anchors out of raw html, and html down to readable text.
+//
+// Deliberately NOT the DOMParser/<template> trick used for job descriptions in
+// page-scripts.js. That runs in a content script, which has a DOM. This runs in
+// the service worker, which does not: there is no `document` to create a
+// <template> from, and `document.createElement` there throws a ReferenceError for
+// *every* message. That made each sync report every email as unreadable and
+// import nothing, while the run still reported ok.
+//
+// These are regex passes over text that is never executed, which is the right
+// trade for a worker anyway: no parsing cost, no nodes, no risk of a mail
+// template's markup being interpreted as anything.
+const HTML_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", "#39": "'", "#34": '"' };
+
+function decodeEntities(value) {
+  return String(value || "").replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (whole, name) => {
+    const key = String(name).toLowerCase();
+    if (HTML_ENTITIES[key] != null) return HTML_ENTITIES[key];
+    if (key[0] === "#") {
+      const code = key[1] === "x" ? parseInt(key.slice(2), 16) : parseInt(key.slice(1), 10);
+      if (Number.isFinite(code) && code > 0 && code <= 0x10ffff) {
+        try {
+          return String.fromCodePoint(code);
+        } catch {
+          return whole;
+        }
+      }
+    }
+    return whole;
+  });
+}
+
 // Walks the MIME tree for the best body available.
 //
 // text/plain is preferred because it is already readable text. text/html is the
-// fallback for the many ATS mail templates that send nothing else, and it is
-// reduced to text with the DOMParser trick used for job descriptions in
-// page-scripts.js — a <template> parses without executing scripts or firing
-// requests, which a detached div assignment would not guarantee.
+// fallback for the many ATS mail templates that send nothing else.
 //
 // The html is also mined for anchors. A confirmation email's single most useful
 // fact is its link to the posting or to an application-status page, and that
@@ -319,25 +444,37 @@ function collectBody(payload) {
   walk(payload);
 
   const htmlText = html.join("\n");
-  if (htmlText) {
-    const template = document.createElement("template");
-    template.innerHTML = htmlText;
-    for (const anchor of template.content.querySelectorAll("a[href]")) {
-      links.push({ href: anchor.getAttribute("href") || "", text: (anchor.textContent || "").trim() });
-    }
+
+  // href first, then the anchor's text: the href attribute itself often carries
+  // tracking parameters that would otherwise dominate the captured text.
+  for (const match of htmlText.matchAll(/<a\b[^>]*?href\s*=\s*("([^"]*)"|'([^']*)'|([^"'>\s]+))[^>]*>([\s\S]*?)<\/a>/gi)) {
+    const href = decodeEntities(match[2] ?? match[3] ?? match[4] ?? "").trim();
+    if (!href) continue;
+    links.push({ href, text: htmlToText(match[5] || "").trim() });
   }
 
-  const text = plain.length
-    ? plain.join("\n")
-    : htmlText
-      ? (() => {
-          const template = document.createElement("template");
-          template.innerHTML = htmlText;
-          return (template.content.textContent || "").replace(/\s+\n/g, "\n");
-        })()
-      : "";
+  const text = plain.length ? plain.join("\n") : htmlToText(htmlText);
 
   return { text, links };
+}
+
+// Markup down to text. Script and style bodies are dropped outright rather than
+// inlined, so a template's CSS does not end up in the body the parser reads for
+// a job title. Block-level tags become newlines to keep the line-oriented
+// heuristics downstream working on something resembling the original layout.
+function htmlToText(html) {
+  const stripped = String(html || "")
+    .replace(/<(script|style|head)\b[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<\s*br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|tr|li|h[1-6]|table|blockquote)\s*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  return decodeEntities(stripped)
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{2,}/g, "\n\n")
+    .trim();
 }
 
 function parseFromHeader(raw) {
@@ -354,13 +491,20 @@ async function getMessage(settings, id) {
   const data = await gmailFetch(settings, `/messages/${encodeURIComponent(id)}?format=full`);
   const headers = (data.payload && data.payload.headers) || [];
   const body = collectBody(data.payload);
+  const dateHeader = headerValue(headers, "date");
 
   return {
     id: data.id || "",
     threadId: data.threadId || "",
     subject: headerValue(headers, "subject"),
     from: parseFromHeader(headerValue(headers, "from")),
-    date: headerValue(headers, "date") || "",
+    date: dateHeader || "",
+    // When the mail actually arrived, in epoch milliseconds. internalDate is
+    // Gmail's own clock and beats the Date header, which is the sending
+    // client's clock and is occasionally nonsense. The importer stamps the
+    // applied / rejected dates from this, so a sync records when the event
+    // happened rather than the day the sync happened to run.
+    receivedAt: Number(data.internalDate) || Date.parse(dateHeader) || 0,
     snippet: String(data.snippet || ""),
     body: body.text,
     links: body.links

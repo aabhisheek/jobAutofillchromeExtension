@@ -72,6 +72,16 @@ const WorkdayAtsAdapter = {
       ],
       selectedListSelector: '[data-automation-id="selectedItemList"]',
       selectedItemSelector: '[data-automation-id="selectedItem"]'
-    }
+    },
+    // Workday's wizard footer. Named here rather than left to the shared text
+    // matching because Workday's forward button is a plain <button> whose label
+    // is often just "Next" with an arrow in a child span — and because the final
+    // step of every Workday application shows "Submit" in the same place, which
+    // the shared engine refuses on its own (see SUBMIT_PATTERN in advanceStep).
+    advanceButton: [
+      '[data-automation-id="footer-next-button"]',
+      '[data-automation-id*="nextButton" i]',
+      'button[data-automation-id*="next" i]'
+    ].join(", ")
   }
 };

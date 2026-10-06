@@ -491,6 +491,17 @@ function buildQuery(settings) {
   return `${base} ${floor}`;
 }
 
+// When the mail itself says the event happened, as epoch milliseconds. Zero or
+// absent means "unknown" and must never be guessed at: a caller that gets null
+// leaves the row's dates alone rather than writing a plausible-looking lie.
+function messageReceivedAt(message) {
+  if (!message) return null;
+  const internal = Number(message.receivedAt);
+  if (Number.isFinite(internal) && internal > 0) return internal;
+  const parsed = Date.parse(message.date || "");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 // Bounded concurrency, preserving order. A plain Promise.all over 25 messages
 // is 25 simultaneous requests to one Gmail quota, and one 429 there fails the
 // whole run.
@@ -530,6 +541,9 @@ async function runSync({ settings, onProgress, force = false } = {}) {
     updated: 0,
     skipped: 0,
     failed: 0,
+    // Rows whose applied / rejected date was stamped from the sync clock by an
+    // older build and has now been repaired from the mail's own date.
+    datesFixed: 0,
     aiEnriched: 0,
     aiSkipped: 0,
     aiFailed: 0,
@@ -604,10 +618,71 @@ async function runSync({ settings, onProgress, force = false } = {}) {
     await mapWithConcurrency(messages, 1, async (message, index) => {
       if (onProgress) onProgress({ phase: "parse", done: index + 1, total: messages.length });
 
-      // A message already turned into a row has nothing left to say. This is
-      // what makes a daily sync safe to leave switched on forever.
+      // A message already turned into a row has nothing left to say — except
+      // its date. Rows written by an older build were stamped with the moment
+      // the sync ran instead of the moment the mail arrived, which is a lie
+      // about when the application was sent or rejected; this pass repairs
+      // them from the message already in hand, and costs one comparison per
+      // message when the dates are already right. This is what still makes a
+      // daily sync safe to leave switched on forever.
       if (imported.has(message.id)) {
-        report.skipped += 1;
+        const emailAt = messageReceivedAt(message);
+        if (!emailAt) {
+          report.skipped += 1;
+          return;
+        }
+
+        const local = parseLocally(message);
+        const index = Tracker.matchIndex(board, {
+          sourceEmailId: message.id,
+          url: local.url,
+          title: local.title,
+          company: local.company,
+          matchLoose: true
+        });
+        if (index === -1) {
+          report.skipped += 1;
+          return;
+        }
+
+        const row = board[index];
+        const patch = {
+          id: row.id,
+          url: row.url,
+          title: row.title,
+          company: row.company,
+          source: row.source,
+          emailAt
+        };
+
+        // The mail that *created* the row is the authority on when the
+        // application went out — no other message can speak to that date. A
+        // rejection mail speaks to the rejection date whether or not it was
+        // the row's first mail, because it is the only evidence of that
+        // outcome there is.
+        const createdRow = !!row.sourceEmailId && row.sourceEmailId === message.id;
+        if (createdRow && row.status !== "saved" && local.status !== "saved" && row.appliedAt !== emailAt) {
+          patch.appliedAt = emailAt;
+        }
+        if (local.status === "rejected" && row.rejectedAt !== emailAt) {
+          patch.rejectedAt = emailAt;
+        }
+        // A rejection mail imported before the rank rule put Rejected above
+        // Applied left the card stranded in Applied — with the right rejection
+        // date and nowhere to show it. This flips the stage from the mail
+        // already in hand; Tracker's own rank rule still refuses to demote an
+        // interview or an offer.
+        if (local.status === "rejected" && row.status === "applied") {
+          patch.status = "rejected";
+        }
+
+        if (patch.appliedAt !== undefined || patch.rejectedAt !== undefined || patch.status !== undefined) {
+          const repaired = await Tracker.save(patch);
+          if (repaired) board[index] = repaired;
+          report.datesFixed += 1;
+        } else {
+          report.skipped += 1;
+        }
         return;
       }
 
@@ -644,6 +719,9 @@ async function runSync({ settings, onProgress, force = false } = {}) {
           source: url ? Tracker.sourceFromUrl(url) : "Email",
           status: fields.status,
           sourceEmailId: message.id,
+          // The mail's own date, so a row created here records when the
+          // application was sent (or rejected), not when this sync ran.
+          emailAt: messageReceivedAt(message),
           notes: `Imported from Gmail — "${(message.subject || "").slice(0, 160) || "(no subject)"}"`,
           matchLoose: true
         };

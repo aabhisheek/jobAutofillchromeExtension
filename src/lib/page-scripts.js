@@ -83,7 +83,7 @@ function scanFormFields(platformConfig = {}, options = {}) {
   // Clearing up front makes the attribute mean "seen during this scan", which
   // is the only thing those guards ever assume.
   //
-  Array.from(document.querySelectorAll(`[${AUTOFILL_ATTR}]`))
+  Array.from(querySelectorDeep(`[${AUTOFILL_ATTR}]`))
     .forEach((el) => {
       el.removeAttribute(AUTOFILL_ATTR);
     });
@@ -286,6 +286,22 @@ function scanFormFields(platformConfig = {}, options = {}) {
   // visibility: hidden
   //
   function isVisible(el) {
+    if (visibleHere(el)) return true;
+
+    // A control that fails the test but lives inside a shadow root is not
+    // necessarily absent: custom elements routinely keep the real input at
+    // display:none beneath a widget they render themselves — SmartRecruiters
+    // does exactly this, and filtering the field out left the page reporting
+    // "0 fields found". Judge the host the control sits in before giving up.
+    const rootNode = el.getRootNode ? el.getRootNode() : null;
+    if (rootNode && rootNode !== document && rootNode.host) {
+      return visibleHere(rootNode.host);
+    }
+
+    return false;
+  }
+
+  function visibleHere(el) {
 
     // If the element has no layout position and has zero dimensions,
     // treat it as hidden.
@@ -490,6 +506,18 @@ function scanFormFields(platformConfig = {}, options = {}) {
   // rescue there can inspect what this resolved without duplicating the walk.
   function resolveOwnLabel(el) {
 
+    // Where this control's own tree ends: the document for light DOM, its
+    // shadow root otherwise. Id references and label[for] resolve within that
+    // tree first and fall back to the document, so a label on either side of
+    // the shadow boundary is found — SmartRecruiters keeps the label in the
+    // light DOM and the control inside the component.
+    const rootNode = el.getRootNode ? el.getRootNode() : null;
+    const scope = rootNode || document;
+    const byId = (id) =>
+      (scope.getElementById && scope.getElementById(id)) ||
+      document.getElementById(id) ||
+      null;
+
 
     // ----------------------------------------------------------
     // 1. Explicit <label for="id">
@@ -520,7 +548,7 @@ function scanFormFields(platformConfig = {}, options = {}) {
       //
       // So ":" is treated as part of the ID rather than CSS syntax.
       //
-      const explicit = document.querySelector(
+      const explicit = scope.querySelector(
         `label[for="${CSS.escape(el.id)}"]`
       );
 
@@ -597,7 +625,7 @@ function scanFormFields(platformConfig = {}, options = {}) {
         .split(/\s+/)
 
         // Find the DOM element for each ID.
-        .map((id) => document.getElementById(id))
+        .map((id) => byId(id))
 
         // Remove IDs that did not match an element.
         .filter(Boolean)
@@ -642,7 +670,7 @@ function scanFormFields(platformConfig = {}, options = {}) {
       //
       // "country-label"
       //
-      const byConvention = document.getElementById(
+      const byConvention = byId(
         `${el.id}-label`
       );
 
@@ -897,7 +925,23 @@ function scanFormFields(platformConfig = {}, options = {}) {
     }
 
 
-    // Nothing worked.
+    // Nothing worked in this tree. A control inside a shadow root has run out
+    // of ancestors at the shadow boundary — its parent chain ends at the shadow
+    // root — while the site's <label> sits in the light DOM beside the custom
+    // element hosting it. SmartRecruiters renders every question that way, so
+    // start over from the host: a label the kit declared as an attribute, its
+    // own id's label, its wrapping label, its nearby text. Nested shadow roots
+    // recurse naturally, one host at a time. (rootNode is computed at the top
+    // of this function, alongside `scope`.)
+    if (rootNode && rootNode !== document && rootNode.host) {
+      const host = rootNode.host;
+      const declared = host.getAttribute && stripPlaceholderNoise(host.getAttribute("label") || "");
+      if (declared) {
+        return declared;
+      }
+      return resolveOwnLabel(host);
+    }
+
     return "";
   }
 
@@ -1151,7 +1195,26 @@ function scanFormFields(platformConfig = {}, options = {}) {
   // <textarea>
   // <select>
   //
-  const simpleEls = document.querySelectorAll(
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
+  const simpleEls = querySelectorDeep(
     "input, textarea, select"
   );
 
@@ -1489,7 +1552,7 @@ function scanFormFields(platformConfig = {}, options = {}) {
       // CSS.escape() protects the name if it contains characters
       // that have special meaning in CSS selectors.
       const group = Array.from(
-        document.querySelectorAll(
+        querySelectorDeep(
           `input[type="radio"][name="${CSS.escape(el.name)}"]`
         )
       ).filter(isVisible);
@@ -1608,7 +1671,7 @@ function scanFormFields(platformConfig = {}, options = {}) {
 
       // Find all visible checkboxes with the same name.
       const sameNameGroup = Array.from(
-        document.querySelectorAll(
+        querySelectorDeep(
           `input[type="checkbox"][name="${CSS.escape(el.name)}"]`
         )
       ).filter(isVisible);
@@ -1894,8 +1957,7 @@ function scanFormFields(platformConfig = {}, options = {}) {
   ].join(", ");
 
 
-  document
-    .querySelectorAll(CUSTOM_CONTROL_SELECTOR)
+  querySelectorDeep(CUSTOM_CONTROL_SELECTOR)
     .forEach((el) => {
 
       // Already emitted by the pass above.
@@ -2399,6 +2461,25 @@ function scanFormFields(platformConfig = {}, options = {}) {
 
 function describeFrames() {
 
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
   return {
     // Whether this is the top document rather than a frame inside it. The
     // caller's fallback path (a page it cannot enumerate frames on) is the top
@@ -2413,12 +2494,12 @@ function describeFrames() {
     // Form controls in THIS frame. Read as counts only, so a frame that is up
     // but still streaming its questions shows up as a rising number across
     // polls instead of a short but plausible scan.
-    controls: document.querySelectorAll("input, textarea, select").length,
+    controls: querySelectorDeep("input, textarea, select").length,
 
     // Nested frames declared here. Summed over every reporting frame this gives
     // the size the frame tree should end up at, so a frame that has not loaded
     // yet — and so cannot report anything about itself — still gets counted.
-    frames: document.querySelectorAll("iframe").length,
+    frames: querySelectorDeep("iframe").length,
 
     origin: (() => {
       try {
@@ -2469,8 +2550,27 @@ async function waitForFormReady(platformConfig = {}, timeoutMs = 2500) {
 
   const choiceConfig = platformConfig.choiceGroups;
 
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
   const count = () =>
-    document.querySelectorAll("input, textarea, select").length +
+    querySelectorDeep("input, textarea, select").length +
     (choiceConfig && choiceConfig.optionSelector
       ? document.querySelectorAll(choiceConfig.optionSelector).length
       : 0);
@@ -2532,12 +2632,29 @@ async function waitForFormReady(platformConfig = {}, timeoutMs = 2500) {
 
 function probePageState(platformConfig = {}) {
 
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
   // Every form control in the top document, however rendered.
   //
-  const all = Array.from(
-    document.querySelectorAll(
-      "input, textarea, select"
-    )
+  const all = querySelectorDeep(
+    "input, textarea, select"
   );
 
 
@@ -2546,8 +2663,7 @@ function probePageState(platformConfig = {}) {
   // because "12 controls in the DOM, 0 visible" (a hidden wizard step, a
   // collapsed section) is the single most useful thing to be able to report.
   //
-  const visible = all.filter((el) => {
-
+  const visibleHere = (el) => {
     if (
       !el.offsetParent &&
       el.offsetWidth === 0 &&
@@ -2562,6 +2678,15 @@ function probePageState(platformConfig = {}) {
       style.display !== "none" &&
       style.visibility !== "hidden"
     );
+  };
+
+  // The host fallback mirrors scanFormFields()'s isVisible(): a shadow input
+  // kept at display:none under the widget its component renders is visible
+  // enough to count, through the host it sits in.
+  const visible = all.filter((el) => {
+    if (visibleHere(el)) return true;
+    const rootNode = el.getRootNode ? el.getRootNode() : null;
+    return !!(rootNode && rootNode !== document && rootNode.host && visibleHere(rootNode.host));
   });
 
 
@@ -2635,6 +2760,25 @@ async function fillFormFields(payload, platformConfig = {}) {
 
   // Same attribute used by scanFormFields().
   const AUTOFILL_ATTR = "data-autofill-uid";
+
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
 
 
   // ==========================================================
@@ -2715,6 +2859,104 @@ async function fillFormFields(payload, platformConfig = {}) {
     setter.call(el, false);
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+
+  // ============================================================
+  // IS THIS CHECKBOX ASKING FOR CONSENT?
+  // ============================================================
+  //
+  // setChecked() can only answer "tick", never "what should this
+  // box say". For a standalone checkbox that is a real question,
+  // because a box is not an answer — it is a permission: to be
+  // contacted, to be emailed, to let something be shared.
+  //
+  // The control gives no way to tell "Are you 18 or older?" from
+  // "Yes, email me product updates". Only the label does, so the
+  // label is all we get to decide on. Ticking the second one on the
+  // user's behalf is consent they never gave, and on some
+  // jurisdictions it is also a compliance problem.
+  //
+  // matcher.js makes the same call earlier and drops the value
+  // before a row ever reaches here. This is the second lock on the
+  // same door, deliberately: a value that arrives from anywhere
+  // else — a stale payload, a future caller, a learned rule that
+  // slipped past a phrase — still cannot tick a consent box.
+  //
+  // Whole-phrase matching, not substring: "I agree" also appears
+  // inside "I agree the information is accurate", which is a
+  // declaration the candidate may genuinely mean to tick. Refusing
+  // that one too would train the user to ignore the highlight and
+  // defeat the point.
+  //
+  // A duplicate of the list in matcher.js rather than a shared
+  // import, because every function in this file is serialized and
+  // injected into the page on its own (see the file header) and has
+  // no access to the popup's scope.
+  //
+  function isConsentCheckboxItem(item) {
+    const label = String((item && item.label) || "")
+      .toLowerCase()
+      .replace(/[*:]/g, " ")
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    // An unlabelled box is not permission to guess.
+    if (!label) return true;
+
+    const phrases = [
+      "opt in",
+      "optin",
+      "opt out",
+      "optout",
+      "subscribe",
+      "unsubscribe",
+      "newsletter",
+      "marketing",
+      "promotional",
+      "promotions",
+      "email me",
+      "email updates",
+      "send me email",
+      "send me updates",
+      "text me",
+      "sms me",
+      "contact me by phone",
+      "contact me by email",
+      "call me",
+      "contact me about",
+      "agree to be contacted",
+      "agree to receive",
+      "agree to the privacy policy",
+      "agree to the terms",
+      "agree to the terms of service",
+      "i agree to the terms",
+      "i consent",
+      "consent to",
+      "permission to contact",
+      "permission to email",
+      "share my information",
+      "share my data",
+      "share my resume",
+      "allow the employer",
+      "allow employers",
+      "may we",
+      "can we contact",
+      "do you agree",
+      "would you like to receive",
+      "would you like us to contact",
+      "keep me posted",
+      "follow up with me"
+    ];
+
+    for (const phrase of phrases) {
+      if (label.includes(phrase)) return true;
+    }
+
+    return /^i agree$/.test(label) ||
+      /^agree$/.test(label) ||
+      /^accept$/.test(label);
   }
 
 
@@ -3041,16 +3283,56 @@ async function fillFormFields(payload, platformConfig = {}) {
   // user reads in the popup and what the answer in profile.json
   // spells out.
   //
-  // Three passes, most precise first:
+  // Two rules, most precise first, tried per accepted text in the order
+  // the answer and its aliases are listed:
   //
-  //   1. exact match          "Yes"      vs "Yes"
-  //   2. startsWith           "Yes"      vs "Yes, I am willing"
-  //   3. contains             "authorized" vs "Yes — authorized to work"
+  //   1. exact match     "Yes"      vs "Yes"
+  //   2. prefix          "Yes"      vs "Yes, I am willing"
+  //   3. standalone      "authorized" vs "Yes — authorized to work"
   //
-  // Exact must win over contains, otherwise the first option that
-  // merely mentions "No" ("No, I do not require sponsorship") could
-  // be picked for an answer of "Yes".
+  // Exact must win over the looser rules, across ALL accepted texts, or
+  // the first option that merely mentions "No" ("No, I do not require
+  // sponsorship") could be picked for an answer of "Yes".
   //
+  // standaloneMatch is what keeps "India" from claiming "British India"
+  // or "British Indian Ocean Territory": a substring buried in a longer
+  // name names something else. The prefix rule runs per-text before the
+  // standalone one so that a shorter alias never claims a row while the
+  // answer itself is still looking ("+91" must not grab
+  // "+1 United States" before "United States" gets its turn).
+  //
+
+  // Whether `want` appears in `text` as a term in its own right. The
+  // occurrence must end at a word boundary ("india" inside "indian" is a
+  // fragment) and must not trail another word — punctuation in front is
+  // fine ("(India)", "🇮🇳 India") and so is a dial code ("+91 India"),
+  // but a word in front ("British", "of") means it is naming something
+  // else and must not be selected.
+  function standaloneMatch(text, want) {
+    if (!want) return false;
+
+    let from = 0;
+    for (;;) {
+      const at = text.indexOf(want, from);
+      if (at === -1) return false;
+
+      const before = text.slice(0, at);
+      const after = text.slice(at + want.length);
+
+      const endsRight = !/[a-z0-9]/.test(after[0] || "");
+
+      const head = before.replace(/\s+$/, "");
+      const startsRight =
+        head === "" ||
+        !/[a-z0-9]$/.test(head) ||
+        (/\s$/.test(before) && /^\+?\d{1,4}$/.test(head));
+
+      if (endsRight && startsRight) return true;
+
+      from = at + 1;
+    }
+  }
+
   function matchOption(options, wantedTexts) {
     // Every text this answer is allowed to match: the displayed value
     // plus any aliases the profile listed alongside it (see `accepts` in
@@ -3067,19 +3349,25 @@ async function fillFormFields(payload, platformConfig = {}) {
 
     const texts = options.map((o) => textOf(o).toLowerCase());
 
-    // Pass 1: exact, across all accepted texts. A full sweep of every
+    // Pass 1: exact, across every accepted text. A full sweep of every
     // alias is done before falling back to a looser rule for any of
     // them, so an exact "No" is never beaten by a "No, not currently"
     // that happens to come earlier in the list.
-    for (const pass of [
-      (t, target) => t === target,
-      (t, target) => t.startsWith(target),
-      (t, target) => t.includes(target)
-    ]) {
-      for (const target of targets) {
-        const hit = texts.findIndex((t) => pass(t, target));
-        if (hit !== -1) return options[hit];
-      }
+    for (const target of targets) {
+      const hit = texts.findIndex((t) => t === target);
+      if (hit !== -1) return options[hit];
+    }
+
+    // Pass 2 and 3: per accepted text, prefix first, then any
+    // occurrence standing on its own.
+    for (const target of targets) {
+      const prefix = texts.findIndex(
+        (t) => t.startsWith(target) && !/[a-z0-9]/.test(t[target.length] || "")
+      );
+      if (prefix !== -1) return options[prefix];
+
+      const loose = texts.findIndex((t) => standaloneMatch(t, target));
+      if (loose !== -1) return options[loose];
     }
 
     return null;
@@ -3821,10 +4109,8 @@ function optionFingerprint(options) {
     if (item.tagName === "radiogroup") {
 
       // Find every element belonging to this group.
-      const group = Array.from(
-        document.querySelectorAll(
-          `[${AUTOFILL_ATTR}="${item.uid}"]`
-        )
+      const group = querySelectorDeep(
+        `[${AUTOFILL_ATTR}="${item.uid}"]`
       );
 
       if (!group.length) {
@@ -3880,13 +4166,16 @@ function optionFingerprint(options) {
       }
 
 
-      // Exact matches across every option win before any looser pass, and each
+      // Exact matches across every option win before any looser rule, and each
       // option is claimed at most once so two similar aliases can't both tick
-      // the same box.
+      // the same box. The looser rules mirror matchOption: a prefix at a word
+      // boundary first, then an occurrence standing on its own — so a country
+      // answer claims "India" or "+91 India" but never "British India".
       const PREDICATES = [
         (text, want) => text === want,
-        (text, want) => text.startsWith(want),
-        (text, want) => text.includes(want)
+        (text, want) =>
+          text.startsWith(want) && !/[a-z0-9]/.test(text[want.length] || ""),
+        (text, want) => standaloneMatch(text, want)
       ];
 
       const picked = [];
@@ -3949,9 +4238,9 @@ function optionFingerprint(options) {
     //
     // Search the page using the UID created by scanFormFields().
     //
-    const el = document.querySelector(
+    const el = querySelectorDeep(
       `[${AUTOFILL_ATTR}="${item.uid}"]`
-    );
+    )[0] || null;
 
 
     // Element disappeared or could not be found.
@@ -4069,6 +4358,27 @@ function optionFingerprint(options) {
       el.type === "checkbox"
     ) {
 
+      // Unless it is asking for consent, in which case the
+      // extension has no answer to give and says so rather than
+      // ticking a permission the user never chose to grant.
+      //
+      // Reported as ok:false, not ok:true, so it surfaces in the
+      // popup's failure list and in the review highlight: this is
+      // something the user is meant to handle, not something that
+      // quietly went fine.
+      //
+      if (isConsentCheckboxItem(item)) {
+
+        report.push({
+          uid: item.uid,
+          ok: false,
+          reason: "Consent checkbox left for you to tick."
+        });
+
+        continue;
+      }
+
+
       setChecked(
         el,
         true
@@ -4116,6 +4426,175 @@ function optionFingerprint(options) {
 
 
 // ============================================================
+// HIGHLIGHT THE FIELDS LEFT FOR THE USER
+// ============================================================
+//
+// The other half of a page-at-a-time pass: fillFormFields fills what it can and
+// reports what it could not, and this makes the remainder visible on the page
+// itself so the user knows where to look before deciding whether to continue.
+//
+// Without it the only signal is a count in the side panel, and the user has to
+// hunt for which field the count refers to — on a long Workday step that is
+// scrolling past a screen of correct values to find the one that needs a human.
+//
+// Two deliberate choices:
+//
+//   1. OUTLINE, NOT BORDER. An outline is painted outside the box and does not
+//      participate in layout, so marking a field cannot move the text or inputs
+//      around it. A border would reflow the form while the user is reading it,
+//      which is how a "just a highlight" feature ends up clicking the wrong
+//      button. It also survives sites that set their own borders with !important,
+//      because our selector is equally specific but loaded later.
+//
+//   2. A CLASS TOGGLED ON THE EXISTING ELEMENT, NOT A WRAPPER DIV. Injecting
+//      nodes around form controls is the classic way to break a framework that
+//      walks up the tree from its own input (Workday resolves a field's container
+//      by climbing ancestors), and it would leave the page dirty for the next
+//      scan. This only ever sets and removes an attribute on elements the scanner
+//      already stamped.
+//
+// Self-contained like every other function here: it is serialized and injected on
+// its own, so it declares its own constant and shares nothing with
+// fillFormFields or matcher.js.
+//
+function highlightReviewFields(request = {}) {
+  const STYLE_ID = "autofill-review-style";
+  const MARK_ATTR = "data-autofill-review";
+
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
+  // Required marker, not :focus or a class: the page owns every other attribute
+  // on these elements and will overwrite anything it thinks is its own state.
+  const STYLE_TEXT = `
+    [${MARK_ATTR}="review"] {
+      outline: 2px solid #d97706 !important;
+      outline-offset: 2px !important;
+      border-radius: 2px;
+    }
+  `;
+
+
+  // --------------------------------------------------------
+  // CLEAR ANY PREVIOUS PASS
+  // --------------------------------------------------------
+  //
+  // Always runs first, including on the clear-only call, so a second fill on the
+  // same step re-highlights from scratch instead of leaving yesterday's marks on
+  // fields that have since been filled.
+  //
+  for (const stale of document.querySelectorAll(`[${MARK_ATTR}]`)) {
+    stale.removeAttribute(MARK_ATTR);
+  }
+
+  const oldStyle = document.getElementById(STYLE_ID);
+  if (oldStyle) oldStyle.remove();
+
+  // A pass with nothing left to show should leave the page exactly as it was,
+  // including not leaving a stylesheet behind.
+  const uids = Array.isArray(request.uids) ? request.uids : [];
+  if (!uids.length) {
+    return { marked: 0, labels: [] };
+  }
+
+
+  // Injected once per pass rather than kept for the extension's lifetime: a
+  // stylesheet that outlives the pass would keep applying to elements the
+  // scanner has since re-stamped for a different question.
+  //
+  const style = document.createElement("style");
+  style.id = STYLE_ID;
+  style.textContent = STYLE_TEXT;
+  (document.head || document.documentElement).appendChild(style);
+
+
+  const labels = [];
+
+  // The scanner's own uids are "af-N", which needs no escaping, but this runs
+  // against an attribute selector with a string that arrived over the messaging
+  // boundary — one stray quote would throw inside the page and take the whole
+  // highlight down with it.
+  const escapeAttr = (value) => {
+    if (window.CSS && typeof window.CSS.escape === "function") {
+      return window.CSS.escape(value);
+    }
+    return String(value).replace(/["\\]/g, "\\$&");
+  };
+
+
+  for (const uid of uids) {
+    if (!uid) continue;
+
+    let el = null;
+    try {
+      el = querySelectorDeep(`[data-autofill-uid="${escapeAttr(String(uid))}"]`)[0] || null;
+    } catch (_) {
+      el = null;
+    }
+    if (!el) continue;
+
+    // Nothing to point at on a hidden field — a collapsed accordion step or an
+    // unopened tab. Marking it would show a mark the user cannot see and cannot
+    // reach, which reads as a bug.
+    const style_ = window.getComputedStyle(el);
+    const hidden =
+      style_.display === "none" ||
+      style_.visibility === "hidden" ||
+      style_.opacity === "0";
+    if (hidden) continue;
+
+    el.setAttribute(MARK_ATTR, "review");
+
+    const label =
+      el.getAttribute("aria-label") ||
+      el.getAttribute("name") ||
+      el.id ||
+      "";
+    if (label) labels.push(label);
+  }
+
+  const marked = document.querySelectorAll(`[${MARK_ATTR}="review"]`).length;
+
+
+  // --------------------------------------------------------
+  // BRING THE FIRST ONE INTO VIEW
+  // --------------------------------------------------------
+  //
+  // Scrolling is the user's own decision to make — the extension must not move
+  // the page under a cursor that is about to click something. So: only ever when
+  // asked, and only to the first outstanding field, and with "auto" rather than
+  // "smooth" so it lands immediately instead of animating while they are
+  // already moving the mouse.
+  //
+  if (request.scroll && marked > 0) {
+    const first = document.querySelector(`[${MARK_ATTR}="review"]`);
+    if (first && typeof first.scrollIntoView === "function") {
+      first.scrollIntoView({ block: "center", behavior: "auto" });
+    }
+  }
+
+
+  return { marked, labels };
+}
+
+
+// ============================================================
 // FILL RESUME FILE
 // ============================================================
 //
@@ -4145,11 +4624,30 @@ function fillResumeFile(
   const AUTOFILL_ATTR =
     "data-autofill-uid";
 
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
 
   // Find the file input by its generated UID.
-  const el = document.querySelector(
+  const el = querySelectorDeep(
     `[${AUTOFILL_ATTR}="${uid}"]`
-  );
+  )[0] || null;
 
 
   // Input no longer exists.
@@ -4767,6 +5265,201 @@ function scanJobDescription() {
 
 
 // ============================================================
+// SCAN JOB LISTINGS (discovery)
+// ============================================================
+//
+// Reads the job cards off a search-results page — LinkedIn's jobs search,
+// Indeed's results, or any board that ships schema.org JobPosting JSON-LD —
+// and returns them as plain objects for the discover engine to score.
+//
+// Three strategies, in the same spirit as scanJobDescription():
+// 1. LinkedIn's own card markup. The tab is opened with the user's logged-in
+//    session, so what this reads is exactly what the person would see.
+// 2. JSON-LD JobPosting blocks, which Greenhouse/Lever/Workday-powered career
+//    sites and most aggregators embed on listing pages.
+// 3. Generic job-shaped links, so an unrecognised board still yields titles
+//    and URLs rather than nothing.
+//
+// These pages are SPAs: the function polls until cards appear or waitForMs
+// elapses, because a tab that is still hydrating must not read as "no jobs".
+// Returns [{ url, title, company, location, snippet }] — deduped by URL,
+// capped at maxCards. Empty array means "nothing recognisable rendered",
+// which on LinkedIn usually means the session was logged out (auth wall).
+//
+// IMPORTANT: self-contained, like every function in this file — it is
+// serialized and injected on its own, with no access to the extension's
+// other scripts.
+// ============================================================
+
+async function scanJobListings(options) {
+  const opts = options || {};
+  const MAX_CARDS = Math.min(Number(opts.maxCards) || 60, 120);
+  const WAIT_MS = Math.max(Number(opts.waitForMs) || 9000, 0);
+  const POLL_MS = 500;
+
+  function textOf(el) {
+    return el && el.textContent ? el.textContent.replace(/\s+/g, " ").trim() : "";
+  }
+
+  function stripHtml(html) {
+    return String(html || "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&#39;|&apos;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // Tracking parameters off, fragment off: two cards for the same posting
+  // through different links must dedupe to one, which is also the form the
+  // tracker matches on.
+  function cleanUrl(href) {
+    if (!href) return "";
+    try {
+      const url = new URL(href, location.href);
+      url.hash = "";
+      for (const key of [...url.searchParams.keys()]) {
+        if (/^(utm_|ref|src|trk|tracking)/i.test(key)) url.searchParams.delete(key);
+      }
+      return url.toString();
+    } catch {
+      return "";
+    }
+  }
+
+  function fromLinkedIn() {
+    const cards = document.querySelectorAll(
+      "li.jobs-search-results__list-item, .jobs-search-results__list-item, " +
+      ".job-card-container, .job-card-list__container li, .jobs-search__results-list-item"
+    );
+    const out = [];
+    for (const card of cards) {
+      const link = card.querySelector(
+        'a[href*="/jobs/view/"], a.job-card-list__link, a[href*="/jobs/"]'
+      );
+      const titleEl = card.querySelector(
+        ".job-card-list__title, .artdeco-base-card__title, h3, h3.base-search-card__title"
+      );
+      const title = textOf(titleEl) || textOf(link);
+      const url = cleanUrl(link && link.getAttribute("href"));
+      if (!title || !url) continue;
+      out.push({
+        url,
+        title,
+        company: textOf(
+          card.querySelector(
+            ".job-card-container__company-name, .artdeco-base-card__subtitle, .job-card-container__primary-description"
+          )
+        ),
+        location: textOf(
+          card.querySelector(
+            ".job-card-container__metadata-item, .artdeco-base-card__flak, .job-search-card__location"
+          )
+        ),
+        snippet: ""
+      });
+    }
+    return out;
+  }
+
+  function jsonLdItems() {
+    const out = [];
+    const blocks = document.querySelectorAll('script[type="application/ld+json"]');
+    for (const block of blocks) {
+      let parsed;
+      try {
+        parsed = JSON.parse(block.textContent || "");
+      } catch {
+        continue; // one malformed block must not sink the others
+      }
+      const list = Array.isArray(parsed)
+        ? parsed
+        : parsed && Array.isArray(parsed["@graph"])
+          ? parsed["@graph"]
+          : [parsed];
+      for (const item of list) {
+        if (!item || typeof item !== "object") continue;
+        const type = item["@type"];
+        const types = Array.isArray(type) ? type : [type];
+        if (!types.some((t) => String(t).toLowerCase() === "jobposting")) continue;
+
+        let location = "";
+        const loc = item.jobLocation;
+        const first = Array.isArray(loc) ? loc[0] : loc;
+        const address = first && first.address;
+        if (address) {
+          location = [address.addressLocality, address.region, address.addressCountry]
+            .filter(Boolean)
+            .join(", ");
+        }
+
+        const org = item.hiringOrganization;
+        out.push({
+          url: cleanUrl(item.url),
+          title: stripHtml(item.title),
+          company: stripHtml((org && (org.name || org.legalName)) || ""),
+          location,
+          snippet: stripHtml(item.description).slice(0, 400)
+        });
+      }
+    }
+    return out;
+  }
+
+  function fromGenericLinks() {
+    const anchors = document.querySelectorAll(
+      'h2.jobTitle a[href], a[href*="/job/"], a[href*="/jobs/"], a[href*="career"], a[href*="position"], a.jtJNE'
+    );
+    const out = [];
+    for (const anchor of anchors) {
+      const title = textOf(anchor);
+      const url = cleanUrl(anchor.getAttribute("href"));
+      // Two words minimum: single-word anchors are "Apply", "Details", nav.
+      if (!url || !title || title.split(" ").length < 2 || title.length > 160) continue;
+      const card = anchor.closest("li, article, .card, .job-card, [data-job-id], div");
+      out.push({
+        url,
+        title,
+        company: "",
+        location: "",
+        snippet: card ? textOf(card).slice(0, 400) : ""
+      });
+    }
+    return out;
+  }
+
+  function collect() {
+    // Union of all three strategies, deduped by URL, LinkedIn first so its
+    // better fields win over the generic link's guess.
+    const seen = new Map();
+    for (const listing of [...fromLinkedIn(), ...jsonLdItems(), ...fromGenericLinks()]) {
+      if (!listing.url || !listing.title) continue;
+      const existing = seen.get(listing.url);
+      if (existing) {
+        if (!existing.company && listing.company) existing.company = listing.company;
+        if (!existing.location && listing.location) existing.location = listing.location;
+        if (!existing.snippet && listing.snippet) existing.snippet = listing.snippet;
+      } else {
+        seen.set(listing.url, listing);
+      }
+    }
+    return [...seen.values()].slice(0, MAX_CARDS);
+  }
+
+  const deadline = Date.now() + WAIT_MS;
+  for (;;) {
+    const found = collect();
+    if (found.length > 0 || Date.now() >= deadline) return found;
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
+}
+
+
+// ============================================================
 // FILL RESUME BY DROP
 // ============================================================
 //
@@ -4802,10 +5495,28 @@ async function fillResumeByDrop(
   const AUTOFILL_ATTR =
     "data-autofill-uid";
 
-  const trigger =
-    document.querySelector(
-      `[${AUTOFILL_ATTR}="${uid}"]`
-    );
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
+  const trigger = querySelectorDeep(
+    `[${AUTOFILL_ATTR}="${uid}"]`
+  )[0] || null;
 
   if (!trigger) {
     return {
@@ -4972,5 +5683,555 @@ async function fillResumeByDrop(
     ok: false,
     reason:
       "the page ignored the simulated drop — click \"Add file\" and choose the file yourself"
+  };
+}
+
+
+// ============================================================
+// ADVANCE TO THE NEXT STEP
+// ============================================================
+//
+// Clicks the wizard's Next / Continue control, and only that control.
+//
+// Two rules make this safe enough to put on a button next to Fill:
+//
+//   1. IT REFUSES WHEN THE FORM IS NOT READY. Every visible control the page
+//      itself marks required and still finds empty is reported back by name and
+//      nothing is clicked. The user gets "3 required fields are still empty"
+//      instead of a step that silently dropped their answers.
+//
+//   2. IT NEVER CLICKS SUBMIT. "Submit Application" is on the same page, is
+//      usually the same shape, and is the one click that cannot be taken back.
+//      Advance means "show me the next step"; submitting stays the user's own
+//      deliberate act, which is what the panel footer promises. A form on its
+//      final step therefore reports "no Next button — this looks like the last
+//      step" and leaves the click alone.
+//
+// Self-contained like every other function here: serialized and injected on its
+// own, so it declares its own helpers and reads its site-specific selectors from
+// the adapter config it is handed.
+//
+// Async because the wait for the new step is a real wait, not a spin. A busy
+// loop would hold the main thread and stop the render it is waiting for — the
+// exact opposite of the intent. chrome.scripting.executeScript awaits a promise
+// returned from an injected function, so this resolves to the panel unchanged;
+// waitForOptions() inside fillFormFields already relies on that.
+async function advanceStep(platformConfig = {}, options = {}) {
+  const ADVANCE_WAIT_MS = 4000;
+  const ADVANCE_POLL_MS = 150;
+
+  // Every match for `selector` in the light DOM and inside open shadow roots,
+  // recursively. SmartRecruiters keeps its form fields in multi-layered shadow
+  // DOM — one custom element inside another — where document.querySelectorAll
+  // sees nothing, and a plain "0 fields found" is the result. Self-contained,
+  // like every function in this file: each injected entry point carries its
+  // own copy (functions are serialized one at a time), and tests/verify-frames.js
+  // asserts they stay byte-identical.
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
+  // Labels that mean "go to the next step". Anchored so that "Next" matches but
+  // "Next of kin" and "Continue shopping" do not, and matched against the whole
+  // trimmed label because these buttons carry an arrow glyph or a count.
+  const ADVANCE_PATTERN =
+    /^(next|next step|next page|continue|continue to next step|proceed|save\s*(and|&)\s*continue|save and proceed|review|review and continue|review your application|step\s*\d+\s*of\s*\d+\s*next)$/i;
+
+  // Labels that END the application. Clicked exactly like an advance control —
+  // this function does not treat a submit as a different, more dangerous kind of
+  // button.
+  //
+  // That is a deliberate reversal of an earlier version of this code, which
+  // matched submit labels only in order to refuse them. The refusal was defensible
+  // in isolation and wrong in practice: a wizard's last step has no Next button,
+  // so refusing there meant the user still had to reach for the mouse on precisely
+  // the one click that matters most, while every earlier step was automated. That
+  // is the worst possible place to reintroduce a manual step.
+  //
+  // What actually keeps this safe is not the label of the button but the state of
+  // the form: the required-field check below refuses while anything mandatory is
+  // empty, and the page's own disabled state is trusted over anything derived
+  // here. A user who can see a filled, valid, reviewed step has already done the
+  // part that needs a human.
+  //
+  const SUBMIT_PATTERN =
+    /^(submit|submit application|submit resume|submit my application|finish|finish application|complete( your)? application|send application|send my application|send resume|attest|attest and submit|submit application now)$/i;
+
+  // Both kinds, tested together, so "is this a button that advances this
+  // application" is one question with one answer at every call site.
+  const isAdvanceish = (label) =>
+    ADVANCE_PATTERN.test(label) || SUBMIT_PATTERN.test(label);
+
+  // Everything the page is willing to treat as its primary action, in the shapes
+  // that shape takes in practice.
+  const CANDIDATE_SELECTOR = [
+    "button",
+    "input[type=submit]",
+    "input[type=button]",
+    "input[type=image]",
+    "a[href]",
+    "[role=button]"
+  ].join(",");
+
+  // Controls the page itself has declared mandatory. aria-required is included
+  // because the ARIA-based widgets (Workday's, Google Forms') carry no `required`
+  // attribute at all — on those a `[required]`-only check reports a fully valid
+  // step as ready.
+  const REQUIRED_SELECTOR = [
+    "input[required]",
+    "select[required]",
+    "textarea[required]",
+    "[aria-required=true]"
+  ].join(",");
+
+
+  function isVisible(el) {
+    // Layout visibility ONLY. Whether the control is disabled is a separate
+    // question, answered by isEnabled() below.
+    //
+    // Folding `disabled` in here is the mistake this shape invites: a wizard that
+    // has disabled its own Next button is reporting its validation verdict, which
+    // is the single most useful thing this function could learn. Treating a
+    // disabled button as invisible throws that away and reports "no Next button
+    // found", which on a half-filled step is both wrong and unactionable.
+    if (!el) return false;
+    if (!el.offsetParent && el.offsetWidth === 0 && el.offsetHeight === 0) {
+      return false;
+    }
+    const style = window.getComputedStyle(el);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }
+
+
+  function isEnabled(el) {
+    return !!(
+      el &&
+      !el.disabled &&
+      el.getAttribute("aria-disabled") !== "true"
+    );
+  }
+
+
+  function textOf(el) {
+    const raw =
+      el.tagName === "INPUT" || el.tagName === "TEXTAREA"
+        ? el.value || ""
+        : el.textContent || el.value || "";
+    return String(raw).replace(/\s+/g, " ").trim();
+  }
+
+
+  // The question a control is answering, for reporting. Walks the same short list
+  // the scanner does, without the adapter's rescue passes — a blocker that cannot
+  // be named is reported by its name/id instead, which is still actionable.
+  function describe(el) {
+    const direct =
+      el.getAttribute("aria-label") ||
+      el.getAttribute("name") ||
+      el.getAttribute("title") ||
+      el.id ||
+      "";
+
+    if (direct) return direct;
+
+    if (el.id) {
+      const label = document.querySelector(`label[for="${el.id}"]`);
+      if (label) {
+        const t = String(label.textContent || "").replace(/\s+/g, " ").trim();
+        if (t) return t;
+      }
+    }
+
+    const wrapper = el.closest("label");
+    if (wrapper) {
+      const t = String(wrapper.textContent || "").replace(/\s+/g, " ").trim();
+      if (t) return t;
+    }
+
+    const placeholder = el.getAttribute("placeholder");
+    return placeholder || "(unlabelled)";
+  }
+
+
+  // --------------------------------------------------------
+  // IS A CONTROL ACTUALLY UNANSWERED?
+  // --------------------------------------------------------
+  //
+  // Presence of `required` is not the same as emptiness, and the two disagree in
+  // ways that matter here:
+  //
+  //   - A required checkbox that is ticked is satisfied. Treating it as empty is
+  //     what makes a wizard look permanently blocked once you tick the consent.
+  //   - A required radio group is satisfied when ANY member is checked, and each
+  //     member is individually marked required by several frameworks. Testing
+  //     them one at a time therefore reports a group the user already answered as
+  //     outstanding, forever.
+  //   - A control the page hides is not something the user can act on, so it
+  //     cannot be the thing that is stopping them.
+  //
+  function isUnanswered(el) {
+    const role = el.getAttribute("role");
+
+    if (role === "checkbox") {
+      return el.getAttribute("aria-checked") !== "true";
+    }
+
+    const type = (el.type || "").toLowerCase();
+
+    // A radio group — ARIA or native — is satisfied when ANY member is checked.
+    //
+    // Both shapes have to go through the group test, because every framework that
+    // marks radio inputs required marks every member of the group, and testing
+    // them one at a time then reports a question the user already answered as
+    // permanently outstanding. For ARIA that check lives on aria-checked; for
+    // native radios it is the `checked` property.
+    if (role === "radio" || type === "radio") {
+      const name = el.getAttribute("name");
+
+      // No name means no group to consult, so the best evidence is this member.
+      if (!name) {
+        return role === "radio"
+          ? el.getAttribute("aria-checked") !== "true"
+          : !el.checked;
+      }
+
+      const group = document.querySelectorAll(
+        `input[type=radio][name="${name}"], [role=radio][name="${name}"]`
+      );
+
+      for (const member of group) {
+        const checked =
+          member.tagName === "INPUT" && (member.type || "").toLowerCase() === "radio"
+            ? member.checked
+            : member.getAttribute("aria-checked") === "true";
+        if (checked) return false;
+      }
+
+      // The group query found nothing (a control with a name but no siblings,
+      // which a framework can produce for a single-option question): fall back to
+      // this element rather than reporting a blocker nothing can clear.
+      if (!group.length) {
+        return role === "radio"
+          ? el.getAttribute("aria-checked") !== "true"
+          : !el.checked;
+      }
+
+      return true;
+    }
+
+    if (type === "checkbox") return !el.checked;
+
+    if (type === "file") {
+      // A required file input the extension attached is satisfied; one it could
+      // not attach is not. Either way the value tells us.
+      return !el.files || el.files.length === 0;
+    }
+
+    return String(el.value == null ? "" : el.value).trim() === "";
+  }
+
+
+  // --------------------------------------------------------
+  // BLOCKERS
+  // --------------------------------------------------------
+  //
+  const blockers = [];
+
+  for (const el of document.querySelectorAll(REQUIRED_SELECTOR)) {
+    if (!isVisible(el)) continue;
+
+    // A hidden control that is nonetheless marked required is the page's own
+    // bookkeeping (a collapsed section, a step behind us). It is not something
+    // the user can see or fix, so it must not block the step they are on.
+    if (isUnanswered(el)) {
+      blockers.push(describe(el));
+    }
+  }
+
+
+  // The buttons the panel knows are still outstanding — fields this extension
+  // could not fill, and fields it deliberately left alone (consent checkboxes).
+  // Passed in from the panel rather than re-derived here, because the page has no
+  // idea which fields the panel tried and gave up on.
+  //
+  // Not a blocker on its own when the page considers the step complete, though:
+  // a form is allowed to have optional questions it will not complain about. So
+  // these are reported alongside the required ones and only stop the click when
+  // the page itself also says the step is incomplete. See `buttonBlocked` below.
+  const outstandingCount = Number(options.outstandingCount || 0);
+  if (outstandingCount > 0) {
+    for (const uid of Array.isArray(options.outstandingUids) ? options.outstandingUids : []) {
+      const el = querySelectorDeep(
+        `[data-autofill-uid="${String(uid).replace(/["\\]/g, "\\$&")}"]`
+      )[0] || null;
+      if (el && isVisible(el)) {
+        blockers.push(`${describe(el)} (not filled)`);
+      }
+    }
+  }
+
+
+  // --------------------------------------------------------
+  // FIND THE ADVANCE CONTROL
+  // --------------------------------------------------------
+  //
+  // An adapter may name the control outright, and that wins over every heuristic
+  // below — a per-site selector is the only thing reliable enough to beat text
+  // matching, and this is the one behaviour a vendor's markup can break without
+  // anyone noticing.
+  //
+  const explicit = platformConfig && platformConfig.advanceButton;
+
+  // Disabled controls are returned, not skipped — see isVisible(). The reason is
+  // that a disabled Next is the page telling us the step is incomplete, and that
+  // is worth reporting rather than hiding behind "no button found".
+  //
+  // `usable` exists for the one case where it would be unsafe to act on what we
+  // found: the click path must never click a control the page has disabled, so it
+  // asks for the usable-only view and treats an empty result as "nothing to click".
+  const findAdvanceButton = (usableOnly) => {
+    if (typeof explicit === "string" && explicit.trim()) {
+      const found = document.querySelectorAll(explicit);
+      for (const candidate of found) {
+        if (!isVisible(candidate)) continue;
+        if (usableOnly && !isEnabled(candidate)) continue;
+        return { candidate, label: textOf(candidate) || explicit };
+      }
+    }
+
+    const candidates = [];
+
+    for (const candidate of document.querySelectorAll(CANDIDATE_SELECTOR)) {
+      if (!isVisible(candidate)) continue;
+
+      const label = textOf(candidate);
+      if (!label) continue;
+
+      if (!isAdvanceish(label)) continue;
+
+      // Prefer an enabled control when the page ships both — a stale hidden copy
+      // of "Next" alongside the live one is common on wizard pages that cache
+      // their footer.
+      const enabled = isEnabled(candidate);
+      if (usableOnly && !enabled) continue;
+
+      candidates.push({ candidate, label, enabled });
+    }
+
+    if (!candidates.length) return null;
+
+    const usable = candidates.filter((c) => c.enabled);
+    const pool = usable.length ? usable : candidates;
+
+    // Last match wins. On a wizard the primary action sits at the end of the
+    // footer, and a "Back"-to-advance pair rendered as siblings puts the
+    // forward control second. Taking the first would click Back often enough to
+    // matter.
+    return pool[pool.length - 1];
+  };
+
+
+  // --------------------------------------------------------
+  // DRY RUN
+  // --------------------------------------------------------
+  //
+  // Reports whether the step could be advanced without clicking anything, so the
+  // panel can grey its Next button out while a required field is still empty.
+  //
+  // Asked on every row change and after every fill, so it has to cost nothing and
+  // change nothing: no event dispatched, no attribute touched, no waiting. That
+  // is also why the blockers are collected before this returns rather than only
+  // when a click is coming — the panel needs the names to highlight, and doing it
+  // twice would double the work on the path that matters.
+  //
+  if (options.dryRun) {
+    const found = findAdvanceButton(false);
+
+    if (!found) {
+      return {
+        ready: false,
+        reason:
+          "No Next, Continue or Submit button found on this page."
+      };
+    }
+
+    if (!isEnabled(found.candidate)) {
+      return {
+        ready: false,
+        blocked: true,
+        label: found.label,
+        isSubmit: SUBMIT_PATTERN.test(found.label),
+        blockers,
+        reason: blockers.length
+          ? `The page has disabled "${found.label}" — ${blockers.length} required field${blockers.length === 1 ? " is" : "s are"} still empty.`
+          : `The page has disabled "${found.label}", so the step is not complete yet.`
+      };
+    }
+
+    if (blockers.length) {
+      return {
+        ready: false,
+        blocked: true,
+        label: found.label,
+        isSubmit: SUBMIT_PATTERN.test(found.label),
+        blockers,
+        reason: `${blockers.length} required field${blockers.length === 1 ? "" : "s"} still empty.`
+      };
+    }
+
+    return {
+      ready: true,
+      label: found.label,
+      // Reported so the panel can warn before an irreversible click. See the
+      // SUBMIT_PATTERN comment: submit is no longer refused, only announced.
+      isSubmit: SUBMIT_PATTERN.test(found.label)
+    };
+  }
+
+
+  const found = findAdvanceButton(true);
+  const button = found ? found.candidate : null;
+  const matchedLabel = found ? found.label : "";
+
+
+  // A submit control was found but never an advance control: this is the last
+  // step. Said plainly, because "no Next button found" on the final step of a
+  // wizard reads like a bug in the extension rather than a job well done.
+  //
+  if (!button) {
+    return {
+      ok: false,
+      advanced: false,
+      reason:
+        "Could not find a Next, Continue or Submit button on this page. Click it yourself."
+    };
+  }
+
+
+  // --------------------------------------------------------
+  // REFUSE WHILE THE PAGE SAYS IT IS NOT READY
+  // --------------------------------------------------------
+  //
+  // The guard on an irreversible click is the state of the form, never the name
+  // of the button. A form with a required field still empty does not advance and
+  // does not submit, whatever its forward control happens to say — and that
+  // includes the case where the page has disabled its own button, which is its
+  // own validation verdict and better evidence than anything derived here.
+  //
+  // Consent checkboxes are deliberately NOT counted as blockers. They are never
+  // filled on the user's behalf (see isConsentCheckboxItem in fillFormFields), so
+  // counting them here would mean a form with a mandatory privacy checkbox could
+  // never be advanced at all. The page's own disabled state is the honest signal
+  // that one is still needed.
+  //
+  if (blockers.length && !options.force) {
+    return {
+      ok: false,
+      advanced: false,
+      blocked: true,
+      label: matchedLabel,
+      isSubmit: SUBMIT_PATTERN.test(matchedLabel),
+      blockers,
+      reason: `Not advancing — ${blockers.length} field${blockers.length === 1 ? "" : "s"} still need${blockers.length === 1 ? "s" : ""} an answer. They are highlighted on the page.`
+    };
+  }
+
+
+  // --------------------------------------------------------
+  // CLICK IT
+  // --------------------------------------------------------
+  //
+  // The full trusted-looking pointer sequence rather than el.click(), because
+  // these wizards frequently gate the transition on the event being a real one
+  // and silently ignore a bare synthetic click — the button flashes and nothing
+  // happens, which reads as "the extension didn't work". Same reasoning as
+  // humanClick() inside fillFormFields.
+  //
+  const base = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    button: 0,
+    buttons: 1
+  };
+
+  ["pointerdown", "mousedown", "pointerup", "mouseup"].forEach((type) => {
+    button.dispatchEvent(new MouseEvent(type, base));
+  });
+
+  button.click();
+
+
+  // --------------------------------------------------------
+  // WAIT FOR THE STEP TO ACTUALLY CHANGE
+  // --------------------------------------------------------
+  //
+  // A click that lands on a wizard that then refuses still looks exactly like
+  // success at the instant it happens. Polling a cheap signature of "this page
+  // is different now" — the URL, the title, how many form controls the scanner
+  // last stamped, and whether the button is still there saying the same thing —
+  // is what lets the panel say "moved on" honestly instead of claiming progress
+  // that did not happen.
+  //
+  // Polled rather than a fixed sleep: most steps swap in ~100ms, and the panel
+  // re-scans the moment this returns.
+  //
+  const signature = () =>
+    [
+      location.href,
+      document.title,
+      querySelectorDeep("[data-autofill-uid]").length,
+      isVisible(button) ? textOf(button) : ""
+    ].join("|");
+
+  const before = signature();
+
+  let changed = false;
+
+  if (options.waitForChange !== false) {
+    // A submit gets a longer budget than a step change. Advancing swaps a form
+    // section in place in ~100ms, but submitting uploads a file, runs the
+    // employer's own validation and often redirects to a confirmation page —
+    // seconds, not milliseconds. Cutting that short would report the application
+    // as "did not move" at exactly the moment it succeeded.
+    const budget = SUBMIT_PATTERN.test(matchedLabel)
+      ? ADVANCE_WAIT_MS * 3
+      : ADVANCE_WAIT_MS;
+
+    const deadline = Date.now() + budget;
+    while (Date.now() < deadline) {
+      if (signature() !== before) {
+        changed = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, ADVANCE_POLL_MS));
+    }
+  }
+
+  const wasSubmit = SUBMIT_PATTERN.test(matchedLabel);
+
+  return {
+    ok: true,
+    advanced: true,
+    label: matchedLabel,
+    isSubmit: wasSubmit,
+    // False means the click was delivered but the page did not move. Reported
+    // rather than assumed, because the user's next action depends on it.
+    changed,
+    blockers,
+    reason: changed
+      ? undefined
+      : wasSubmit
+        ? `Clicked "${matchedLabel}", but the page did not change. It may still be uploading — give it a moment and check before clicking again.`
+        : `Clicked "${matchedLabel}", but the page did not move. It may have rejected the step — check the highlighted fields.`
   };
 }

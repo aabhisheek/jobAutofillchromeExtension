@@ -10,7 +10,10 @@ const start = src.indexOf("function parseSyncTime");
 const end = src.indexOf("async function scheduleEmailSync");
 const ctx = vm.createContext({ Date, JSON });
 vm.runInContext(src.slice(start, end), ctx);
-const { parseSyncTime, nextRunAt } = vm.runInContext("({ parseSyncTime, nextRunAt })", ctx);
+const { parseSyncTime, nextRunAt, nextIntervalRunAt } = vm.runInContext(
+  "({ parseSyncTime, nextRunAt, nextIntervalRunAt })",
+  ctx
+);
 
 const { eq, done } = expect("alarm");
 
@@ -51,5 +54,25 @@ eq("bad value falls back to 09:00", new Date(nextRunAt("garbage", before)).getHo
 let t = before; const hours = new Set();
 for (let i = 0; i < 24; i++) { const n = nextRunAt("07:45", t); hours.add(new Date(n).getTime()); t = n; }
 eq("24 runs, 24 distinct times", hours.size, 24);
+
+// ---- interval schedules (hourly / every two hours) -----------------------
+// The worker reconciles its alarm on every wake, so the anchor has to be a
+// pure function of (last run, period): the same inputs must give the same
+// future instant every time, or a frequently-restarting worker would keep
+// pushing the alarm forward and the schedule would never fire at all.
+eq("no last run falls back to the daily anchor", nextIntervalRunAt(null, 120, before), null);
+eq("first run is one period after the last", nextIntervalRunAt(before, 120, before), before + 120 * 60000);
+
+// Five hours since the last 2-hourly run: the two missed slots are NOT
+// replayed — the next firing lands one period ahead of the most recent
+// multiple, i.e. an hour from now.
+const stale = before - 5 * 3600e3;
+eq("stale last run lands within one period", nextIntervalRunAt(stale, 120, before), before + 3600e3);
+eq("hourly period", nextIntervalRunAt(before, 60, before), before + 60 * 60000);
+eq("reconcile-stable (same inputs, same instant)",
+   nextIntervalRunAt(stale, 120, before), nextIntervalRunAt(stale, 120, before));
+// A last run stamped in the future (clock skew) must not schedule in the past.
+eq("future last run still lands ahead",
+   nextIntervalRunAt(before + 3600e3, 60, before) > before, true);
 
 process.exit(done() ? 1 : 0);

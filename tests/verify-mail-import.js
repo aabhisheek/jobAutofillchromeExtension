@@ -196,5 +196,22 @@ console.log("--- tracker upsert / dedupe ---");
   eq("loose title/company", matchIndex(items, { title: "A", company: "B", matchLoose: true }), -1);
   eq("no loose match without the flag", matchIndex(items, { title: "x", company: "y" }), -1);
 
+  // 13. A rejection mail lands on a card that already reads Applied: same
+  //     card, now Rejected — that is the only way the rejection date ever
+  //     reaches the board. A stale applied mail must not undo it afterwards.
+  await T.clear();
+  await T.save({ sourceEmailId: "r1", title: "Data Engineer", company: "Globex", status: "applied", matchLoose: true });
+  await T.save({ sourceEmailId: "r2", title: "Data Engineer", company: "Globex", status: "rejected", matchLoose: true });
+  all = await T.list();
+  eq("rejection merged into the applied card", all.length, 1);
+  eq("card moved applied -> rejected", all[0].status, "rejected");
+  await T.save({ sourceEmailId: "r3", title: "Data Engineer", company: "Globex", status: "applied", matchLoose: true });
+  eq("stale applied mail cannot un-reject", (await T.list())[0].status, "rejected");
+
+  // 14. Rejected still cannot demote the two live stages.
+  await T.setStatus((await T.list())[0].id, "interview");
+  await T.save({ sourceEmailId: "r4", title: "Data Engineer", company: "Globex", status: "rejected", matchLoose: true });
+  eq("rejection does not demote interview", (await T.list())[0].status, "interview");
+
   process.exit(done() ? 1 : 0);
 })();

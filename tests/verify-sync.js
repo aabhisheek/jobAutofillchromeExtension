@@ -66,7 +66,18 @@ ctx.Gmail = {
       address: at > 0 ? raw.slice(at + 1, raw.length - 1) : raw,
       domain: at > 0 ? raw.slice(at + 1, raw.length - 1).split("@")[1] : ""
     };
-    return { id: m.id, subject: header("subject"), from, snippet: m.snippet || "", body: "", links: m.links || [] };
+    const date = header("date");
+    return {
+      id: m.id,
+      subject: header("subject"),
+      from,
+      date,
+      // Same shape gmail.js returns: when the mail arrived, not when it is read.
+      receivedAt: m.receivedAt || Date.parse(date) || 0,
+      snippet: m.snippet || "",
+      body: "",
+      links: m.links || []
+    };
   }
 };
 load(ctx, "src/lib/mail-import.js");
@@ -77,19 +88,35 @@ function msg(id, subject, from, extra = {}) {
   return { id, headers: [{ name: "subject", value: subject }, { name: "from", value: from }], ...extra };
 }
 
+// Each message carries its own arrival date, days apart, so any assertion
+// about "the email's date" can never be satisfied by the sync's own clock.
+const DAY_MS = 86400000;
+const AT = (daysAgo) => Date.now() - daysAgo * DAY_MS;
+const A1_AT = AT(20);
+const A2_AT = AT(19);
+const A3_AT = AT(18);
+const B1_AT = AT(15);
+const C1_AT = AT(12);
+const D1_AT = AT(5);
+const E1_AT = AT(10);
+
 // Five messages: two for the same job (applied + interview), three others.
 MESSAGES.push(
-  msg("a1", "Application received: Your application for Backend Engineer at Acme Corp", "Acme Careers <careers@acme.com>"),
+  msg("a1", "Application received: Your application for Backend Engineer at Acme Corp", "Acme Careers <careers@acme.com>",
+      { receivedAt: A1_AT }),
   msg("a2", "Interview invitation - Backend Engineer at Acme Corp", "Acme Careers <careers@acme.com>",
-      { snippet: "We would like to invite you to a phone screen." }),
-  msg("b1", "Your application for Data Engineer at Globex", "no-reply@globex.com"),
-  msg("c1", "We received your application for SRE at Initech", "Recruiting <talent@wd5.myworkdayjobs.com>"),
+      { receivedAt: A2_AT, snippet: "We would like to invite you to a phone screen." }),
+  msg("b1", "Your application for Data Engineer at Globex", "no-reply@globex.com",
+      { receivedAt: B1_AT }),
+  msg("c1", "We received your application for SRE at Initech", "Recruiting <talent@wd5.myworkdayjobs.com>",
+      { receivedAt: C1_AT }),
   msg("d1", "Unfortunately, we will not be moving forward with your application", "Acme Careers <careers@acme.com>",
-      { snippet: "We received your application but will not be moving forward." })
+      { receivedAt: D1_AT, snippet: "We received your application but will not be moving forward." })
 );
 
 AI_REPLIES["Requisition"] = { title: "ML Engineer", company: "Acme Corp", url: "https://acme.com/j/7", stage: "applied" };
-MESSAGES.push(msg("e1", "Application Received - Requisition 88123 - DEEP-DIVE", "Talent <no-reply@acme.com>"));
+MESSAGES.push(msg("e1", "Application Received - Requisition 88123 - DEEP-DIVE", "Talent <no-reply@acme.com>",
+    { receivedAt: E1_AT }));
 
 const { eq, done } = expect("sync");
 
@@ -128,15 +155,22 @@ const { eq, done } = expect("sync");
   eq("acme role", acme.title, "Backend Engineer");
   eq("acme url empty", acme.url, "");
   eq("acme source", acme.source, "Email");
+  // The whole point of carrying the mail's date: an import records when the
+  // application went out, never the moment this sync happened to run.
+  eq("applied date is the confirmation email's date", acme.appliedAt, A1_AT);
+  eq("and it is in the past, not the sync's clock", acme.appliedAt < Date.now(), true);
 
   const ml = rows.find((r) => r.title === "ML Engineer");
   eq("AI corrected the requisition-only subject", !!ml, true);
   eq("AI url adopted", ml.url, "https://acme.com/j/7");
   eq("AI url -> ATS-free source is the host", ml.source, "acme.com");
+  eq("AI-imported row is dated from its email too", ml.appliedAt, E1_AT);
 
   const rej = rows.find((r) => r.company && r.status === "rejected");
   eq("rejection row exists", !!rej, true);
   eq("rejection counts as applied", Number.isFinite(rej.appliedAt), true);
+  eq("rejection dated from the rejection email", rej.rejectedAt, D1_AT);
+  eq("rejection's applied stamp comes from the same mail", rej.appliedAt, D1_AT);
 
   // ---- 2. second run is a no-op ----
   aiCalls = 0;
@@ -145,10 +179,43 @@ const { eq, done } = expect("sync");
   eq("second run skipped all", again.skipped, 6);
   eq("second run added nothing", again.added, 0);
   eq("second run spent no AI", aiCalls, 0);
+  eq("dates already right, nothing to repair", again.datesFixed, 0);
   eq("board unchanged", (await T.list()).length, 5);
 
+  // ---- 2b. rows stamped by an older build are repaired from the mail date ----
+  // The bug this replaces: appliedAt/rejectedAt written as Date.now() at sync
+  // time. The mail for every row is still in hand on the next run, so the
+  // wrong stamp is rewritten from the message's own date — once.
+  await T.save({ id: acme.id, appliedAt: Date.now() });
+  await T.save({ id: rej.id, rejectedAt: Date.now() });
+  const repair = await M.runSync({ settings });
+  eq("both wrong dates found and repaired", repair.datesFixed, 2);
+  eq("nothing else touched", repair.skipped, 4);
+  eq("acme applied date restored to the email's date",
+     (await T.list()).find((r) => r.sourceEmailId === "a1").appliedAt, A1_AT);
+  eq("rejection date restored to the rejection email's date",
+     (await T.list()).find((r) => r.status === "rejected").rejectedAt, D1_AT);
+  const settled = await M.runSync({ settings });
+  eq("a repaired row is not repaired again", settled.datesFixed, 0);
+  eq("and the run goes back to skipping", settled.skipped, 6);
+
+  // ---- 2c. a card stranded in Applied by the old rank rule is flipped ----
+  // The rejection mail is already in the ledger, so only the repair pass can
+  // reach it. The stage moves, the date stays the mail's own — this is what
+  // makes an old board catch up without a manual "Re-import everything".
+  await T.setStatus(rej.id, "applied");
+  const flip = await M.runSync({ settings });
+  eq("stranded card found and repaired", flip.datesFixed, 1);
+  const flipped = (await T.list()).find((r) => r.sourceEmailId === "d1");
+  eq("card moved applied -> rejected", flipped.status, "rejected");
+  eq("rejection date still the mail's date", flipped.rejectedAt, D1_AT);
+  const settledAfterFlip = await M.runSync({ settings });
+  eq("flipped card is not repaired again", settledAfterFlip.datesFixed, 0);
+  eq("and the run goes back to skipping", settledAfterFlip.skipped, 6);
+
   // ---- 3. a new interview mail for a tracked job updates that card ----
-  MESSAGES.push(msg("a3", "Interview invitation - Backend Engineer at Acme Corp", "Acme Careers <careers@acme.com>"));
+  MESSAGES.push(msg("a3", "Interview invitation - Backend Engineer at Acme Corp", "Acme Careers <careers@acme.com>",
+      { receivedAt: A3_AT }));
   const third = await M.runSync({ settings });
   eq("third run scanned seven", third.scanned, 7);
   eq("the extra mail updated the card", third.updated, 1);
@@ -219,13 +286,20 @@ const { eq, done } = expect("sync");
   eq("with a reason", /switched off/i.test(off.notes[0]), true);
   const forced = await M.runSync({ settings: { ...settings, emailSyncEnabled: false }, force: true });
   eq("forced runs anyway", forced.ok, true);
-  const noClient = await M.runSync({ settings: { ...settings, gmailClientId: "" } });
-  eq("missing client id is refused", /client id/i.test(noClient.notes[0]), true);
 
-  // ---- 10. state is written for the panel to render ----
+  // Read the persisted state HERE, immediately after the run being checked.
+  // A refused run still calls writeSyncState with its own report, so reading
+  // state after any further runSync would compare against the wrong run — which
+  // is how this assertion once "passed" only when two runs shared a millisecond.
   const state = await M.readSyncState();
   eq("state is the latest run", state.at, forced.at);
   eq("state has the numbers", typeof state.added === "number" && typeof state.scanned === "number", true);
+
+  const noClient = await M.runSync({ settings: { ...settings, gmailClientId: "" } });
+  eq("missing client id is refused", /client id/i.test(noClient.notes[0]), true);
+  eq("a refused run still records state for the panel", (await M.readSyncState()).at, noClient.at);
+
+  // ---- 10. state is written for the panel to render ----
 
   process.exit(done() ? 1 : 0);
 })();

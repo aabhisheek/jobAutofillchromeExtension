@@ -63,7 +63,14 @@
       <div id="field-list"></div>
 
       <div id="fill-bar" class="hidden">
-        <button id="fill-btn">Fill Selected Fields</button>
+        <div class="fill-actions">
+          <button id="fill-btn">Fill Selected Fields</button>
+          <button id="next-btn">Next Step</button>
+        </div>
+        <!-- Set on the Next button once the page reports that its forward
+             control is a submit rather than a step change, so the irreversible
+             click is named before it is offered rather than after. -->
+        <div id="submit-warning" class="submit-warning hidden"></div>
         <span id="fill-status" class="muted"></span>
       </div>
     </div>
@@ -73,7 +80,7 @@
       <button id="footer-track" class="link-btn">Track Job</button>
       <button id="footer-dashboard" class="link-btn">Dashboard</button>
       <button id="footer-resume" class="link-btn">Tailor Resume for This Job</button>
-      <span class="muted">Nothing is ever submitted automatically.</span>
+      <span class="muted">Next and Submit are yours to click — never automatic.</span>
     </footer>
 
     <script src="../lib/theme.js"></script>

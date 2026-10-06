@@ -145,6 +145,39 @@
   word-break: break-word;
 }
 
+/* Role and company are machine guesses the user is expected to correct: both
+   read as text but start editing on click. The dotted underline is the only
+   affordance that fit a card this small without a third control. */
+.app-card .edit-field {
+  cursor: text;
+  border-radius: var(--radius-sm);
+}
+
+.app-card .edit-field:hover {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.app-card .inline-edit {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 2px 5px;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.3;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
+.app-card .inline-edit:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
 /* Source and age share a line because both are one-glance facts. The source is a
    quiet outlined label, not a filled pill — a board of ten cards should not be a
    wall of colour. */
@@ -177,6 +210,17 @@
   font-size: 10px;
   color: var(--text-subtle);
   cursor: help;
+}
+
+/* The discovery rating: amber stars read as a rating at a glance without
+   competing with the status pill, and the hover title carries the numbers. */
+.app-card .rating {
+  flex: none;
+  color: var(--warning);
+  font-size: 11px;
+  letter-spacing: 0.2px;
+  cursor: help;
+  white-space: nowrap;
 }
 
 .app-card .actions {
@@ -283,6 +327,86 @@ code {
   font-size: 11px;
 }
 
+/* A value the user has to copy and compare character by character against
+   Google Cloud, so it gets its own line and room to breathe. */
+.code-block {
+  display: block;
+  margin: 5px 0;
+  padding: 7px 9px;
+  border-style: dashed;
+  font-size: 11.5px;
+  word-break: break-all;
+  user-select: all;
+}
+
+/* The two identifiers that have to agree, side by side so a mismatch is
+   visible rather than something to be hunted for across two screens. */
+.diag-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px 16px;
+  margin: 4px 0 2px;
+}
+
+.diag-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+}
+
+.diag-grid .code-block { margin-top: 4px; }
+
+/* Sits directly under the value it copies, so the eye never travels between the
+   box and the button. Ghost styling to keep it subordinate to the diagnostics. */
+.diag-grid .copy-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+/* The per-email reasons a sync could not read something. Shown whenever the
+   count is non-zero: a bare "5 unreadable" with the reason hidden leaves nothing
+   to act on, which is the same as showing nothing at all. */
+.fail-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius);
+  background: var(--danger-bg);
+}
+.fail-box strong { font-size: 12px; color: var(--danger); }
+.fail-box .fail-line {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+
+/* Which build of the dashboard is actually running. Sized to sit quietly in the
+   panel summary, but never hidden — its whole job is to end the "am I looking at
+   cached code?" question. */
+.build-stamp {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-soft);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--text-subtle);
+  vertical-align: middle;
+  user-select: all;
+}
+
 .conn-row {
   display: flex;
   align-items: center;
@@ -320,6 +444,27 @@ code {
 
 .check-row input { margin: 2px 0 0; flex: none; }
 .check-row .panel-hint { margin-top: 3px; }
+.check-row span { font-size: 12px; color: var(--text-muted); }
+
+.field-optional { font-weight: 400; color: var(--text-muted); }
+
+.setup-notes {
+  margin: 6px 0 12px;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+.setup-notes li { margin-bottom: 6px; }
+.setup-notes strong { color: var(--text); }
+.setup-notes code {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--bg-soft);
+  padding: 1px 4px;
+  border-radius: 3px;
+  word-break: break-all;
+}
 
 .mail-grid { margin-bottom: 12px; }
 .mail-grid select, .mail-grid input { width: 100%; }

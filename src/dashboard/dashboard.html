@@ -33,6 +33,7 @@
               <p class="sub">Every job you have saved or applied to, and how the pipeline is going.</p>
             </div>
             <div class="actions">
+              <button id="find-jobs">Find jobs</button>
               <button id="export-csv">Export CSV</button>
               <button id="refresh">Refresh</button>
               <button id="clear-all" class="ghost">Clear all</button>
@@ -76,8 +77,14 @@
             </form>
           </details>
 
-          <details class="card add-panel" id="mail-panel">
-            <summary>Import from Gmail</summary>
+          <!-- `open` by default: the Gmail connection diagnostics live inside this
+               panel, and a collapsed panel hides exactly the thing you need when
+               connecting is failing. -->
+          <details class="card add-panel" id="mail-panel" open>
+            <summary>
+              Import from Gmail
+              <span id="mail-build" class="build-stamp"></span>
+            </summary>
             <div class="add-form">
               <p class="panel-note">
                 Reads the confirmation emails every ATS already sends you and turns them into cards on
@@ -106,6 +113,13 @@
                     <a href="https://console.cloud.google.com/apis/library/gmail.googleapis.com" target="_blank" rel="noreferrer">Gmail API</a>.
                   </li>
                 </ol>
+              </div>
+
+              <!-- Credentials and the two values that must agree. Deliberately
+                   OUTSIDE #mail-setup, which collapses once a client id exists:
+                   this is the block you need precisely when connecting fails, so
+                   hiding it behind the setup prose would hide the diagnosis. -->
+              <div class="mail-step">
                 <label class="field-label" for="mail-client-id">Google OAuth Client ID</label>
                 <input
                   type="text"
@@ -114,11 +128,87 @@
                   spellcheck="false"
                 />
                 <p class="panel-hint">
-                  The redirect URI Google will ask for is fixed by this extension and is added
-                  automatically &mdash; there is nothing to register.
+                  From Google Cloud &rarr; APIs &amp; Services &rarr; Credentials. Either client type
+                  works, and they are configured differently:
                 </p>
+                <ul class="setup-notes">
+                  <li>
+                    <strong>Chrome Extension</strong> &mdash; put your extension ID above in
+                    <em>Application ID</em>. No secret; leave the field below empty.
+                  </li>
+                  <li>
+                    <strong>Web application</strong> &mdash; copy the redirect URI from the box
+                    below and add it to <em>Authorized redirect URIs</em>, then paste its client
+                    secret into the field underneath. Use the
+                    <strong>Copy redirect URI</strong> button: a missing or extra trailing slash is
+                    a <code>redirect_uri_mismatch</code>, and Google treats these as exact strings.
+                  </li>
+                </ul>
+
+                <label class="field-label" for="mail-client-secret">
+                  Client secret <span class="field-optional">(Web client only)</span>
+                </label>
+                <input
+                  type="password"
+                  id="mail-client-secret"
+                  placeholder="GOCSPX-…"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <p class="panel-hint">
+                  Google&rsquo;s token endpoint rejects a Web client id with
+                  <code>client_secret is missing</code>, so it is sent when set. Stored in this
+                  browser only, and never written to the extension&rsquo;s files. Rotate it in Google
+                  Cloud if it has ever been pasted into a public place.
+                </p>
+                <div class="diag-grid">
+                  <div>
+                    <span class="diag-label">Extension ID</span>
+                    <code id="mail-ext-id" class="code-block"></code>
+                    <button type="button" class="ghost copy-btn" data-copy="#mail-ext-id">
+                      Copy extension ID
+                    </button>
+                  </div>
+                  <div>
+                    <span class="diag-label">Redirect URI sent to Google</span>
+                    <code id="mail-redirect-uri" class="code-block"></code>
+                    <button
+                      type="button"
+                      class="ghost copy-btn"
+                      data-copy="#mail-redirect-uri"
+                    >
+                      Copy redirect URI
+                    </button>
+                  </div>
+                </div>
+                <p class="panel-hint">
+                  <strong>Which Google Cloud field each value goes in:</strong>
+                </p>
+                <ul class="setup-notes">
+                  <li>
+                    <strong>Chrome Extension</strong> client &rarr; set <em>Application ID</em> to
+                    the extension ID. Google derives the redirect URI from it, so there is nothing
+                    to paste and no redirect URI to register.
+                  </li>
+                  <li>
+                    <strong>Web application</strong> client &rarr; add the redirect URI to
+                    <em>Authorized redirect URIs</em>. Add it as its own row; don&rsquo;t edit or
+                    remove anything already listed, since other installs rely on those entries.
+                  </li>
+                </ul>
+                <p class="panel-hint">
+                  If either one disagrees, connecting fails with
+                  <code>Error 400: redirect_uri_mismatch</code> before any consent screen appears.
+                  Find your extension ID on <code>chrome://extensions</code>; moving the folder on
+                  disk changes an unpacked extension&rsquo;s ID, which changes both values above.
+                </p>
+                <label class="check-row">
+                  <input type="checkbox" id="mail-clear-secret" />
+                  <span>Forget the stored client secret</span>
+                </label>
+
                 <div class="toolbar add-actions">
-                  <button type="button" id="mail-save-client" class="primary">Save client ID</button>
+                  <button type="button" id="mail-save-client" class="primary">Save client credentials</button>
                   <span id="mail-setup-msg" class="status-msg"></span>
                 </div>
               </div>
@@ -143,18 +233,28 @@
                 <label class="check-row">
                   <input type="checkbox" id="mail-enabled" />
                   <span>
-                    <strong>Check my mail every day</strong>
+                    <strong>Check my mail automatically</strong>
                     <span class="panel-hint">
-                      Runs in Chrome's own scheduler. Chrome only fires alarms while it is running, and
-                      a missed day is picked up by the next one.
+                      Runs in Chrome's own scheduler — hourly, every 2 hours or daily, per the choice
+                      below. Chrome only fires alarms while it is running, and a missed check is
+                      picked up by the next one. Opening this dashboard also checks for new mail
+                      straight away — you never have to press Sync now for a routine check.
                     </span>
                   </span>
                 </label>
 
                 <div class="grid-2 mail-grid">
                   <div>
-                    <label class="field-label" for="mail-time">Daily at</label>
-                    <input type="time" id="mail-time" value="09:00" />
+                    <label class="field-label" for="mail-every">Check mail</label>
+                    <select id="mail-every">
+                      <option value="1h">Every hour</option>
+                      <option value="2h">Every 2 hours</option>
+                      <option value="daily">Once a day</option>
+                    </select>
+                    <div id="mail-time-row">
+                      <label class="field-label" for="mail-time">Daily at</label>
+                      <input type="time" id="mail-time" value="09:00" />
+                    </div>
                   </div>
                   <div>
                     <label class="field-label" for="mail-lookback">Look back</label>
@@ -165,6 +265,11 @@
                     </select>
                   </div>
                 </div>
+                <p class="panel-hint">
+                  Checking often is cheap: only genuinely new emails are ever read (the ledger
+                  remembers the rest), so a check that finds nothing makes no AI calls at all —
+                  and with AI off the parse never leaves this machine.
+                </p>
 
                 <label class="field-label" for="mail-query">Gmail search</label>
                 <input type="text" id="mail-query" spellcheck="false" />
@@ -192,6 +297,85 @@
                   <span id="mail-status-msg" class="status-msg"></span>
                 </div>
                 <p id="mail-last-run" class="panel-hint"></p>
+                <div id="mail-last-run-errors" class="fail-box hidden"></div>
+              </div>
+            </div>
+          </details>
+
+          <!-- Job discovery: searches the boards for matching roles and puts
+               the best few on the board with a rating. Open by default, and
+               reachable from the Find jobs button in the page head — this is
+               the feature the user comes here for, and hiding it behind a
+               collapsed row made it impossible to find. -->
+          <details class="card add-panel" id="discover-panel" open>
+            <summary>
+              Find jobs for me
+              <span id="discover-build" class="build-stamp"></span>
+            </summary>
+            <div class="mail-steps">
+              <div class="mail-step">
+                <p class="panel-hint">
+                  Searches LinkedIn and other job boards for your target roles, scores each posting
+                  against your profile, and adds the top matches to the board as
+                  <strong>Saved</strong> cards with a star rating and a shortlist chance. Opens the
+                  searches in background tabs using your own signed-in session, then closes them —
+                  nothing is applied to, and everything stays in this browser.
+                </p>
+
+                <label class="field-label" for="discover-roles">Target roles</label>
+                <input type="text" id="discover-roles" spellcheck="false"
+                       placeholder="Backend Engineer, Full Stack Developer" />
+                <p class="panel-hint">
+                  Comma-separated. Leave empty to search for the job titles already in your profile.
+                </p>
+
+                <div class="grid-2 mail-grid">
+                  <div>
+                    <label class="field-label" for="discover-location">Location (optional)</label>
+                    <input type="text" id="discover-location" spellcheck="false"
+                           placeholder="Bangalore, India" />
+                  </div>
+                  <div>
+                    <label class="field-label" for="discover-max">Add up to</label>
+                    <select id="discover-max">
+                      <option value="10">Top 10 jobs</option>
+                      <option value="20" selected>Top 20 jobs</option>
+                      <option value="30">Top 30 jobs</option>
+                      <option value="50">Top 50 jobs</option>
+                    </select>
+                  </div>
+                </div>
+
+                <label class="check-row">
+                  <input type="checkbox" id="discover-auto" />
+                  <span>
+                    <strong>Search automatically</strong>
+                    <span class="panel-hint">
+                      Runs when you open this dashboard — at most once every 2 hours, so a
+                      frequently-reopened board does not hammer the job sites. The button below
+                      always runs regardless.
+                    </span>
+                  </span>
+                </label>
+
+                <label class="check-row">
+                  <input type="checkbox" id="discover-use-ai" />
+                  <span>
+                    <strong>Use AI for the shortlist chance</strong>
+                    <span class="panel-hint">
+                      Scores how likely you are to be shortlisted for the top matches, using the
+                      provider configured in API Keys, in a single batched call. Off still gives
+                      the match percentage and stars — those are computed locally.
+                    </span>
+                  </span>
+                </label>
+
+                <div class="toolbar add-actions">
+                  <button type="button" id="discover-save" class="primary">Save settings</button>
+                  <button type="button" id="discover-run">Find jobs now</button>
+                  <span id="discover-status-msg" class="status-msg"></span>
+                </div>
+                <p id="discover-last-run" class="panel-hint"></p>
               </div>
             </div>
           </details>
@@ -216,6 +400,12 @@
     <script src="../lib/tracker.js"></script>
     <script src="../lib/gmail.js"></script>
     <script src="../lib/mail-import.js"></script>
+    <!-- Discovery's dependencies, in load order: the keyword/match logic it
+         scores with, the injectable listing reader it runs inside a search
+         tab, and the engine itself. -->
+    <script src="../lib/resume-tailor.js"></script>
+    <script src="../lib/page-scripts.js"></script>
+    <script src="../lib/discover.js"></script>
     <script src="dashboard.js"></script>
   </body>
 </html>

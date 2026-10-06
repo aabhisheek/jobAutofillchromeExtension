@@ -60,6 +60,112 @@ function findDictionaryMatch(normalizedLabel, field, learned) {
   return null;
 }
 
+// --------------------------------------------------------
+// CONSENT CHECKBOXES
+// --------------------------------------------------------
+//
+// A standalone <input type=checkbox> is not an answer, it is a permission: to be
+// contacted, to be photographed, to declare something true on the employer's
+// record. The filler treats a checkbox as "the requested action is to tick it"
+// (see the checkbox branch in fillFormFields, page-scripts.js), which is right
+// for "Are you 18 or older?" and disastrous for "Yes, send me marketing email".
+//
+// Nothing about the control distinguishes the two — only the label does. So the
+// question every standalone checkbox has to pass is: does its label ask about a
+// fact about the candidate, or ask for consent to do something to them?
+//
+// These are matched as whole phrases rather than substrings on purpose. "I agree"
+// appears inside "I agree that the information is accurate", which IS a
+// declaration the candidate may well mean to tick. Substring matching would
+// refuse that too, which trains the user to distrust the highlight and start
+// ignoring it.
+const CONSENT_CHECKBOX_PHRASES = [
+  "opt in",
+  "optin",
+  "opt out",
+  "optout",
+  "subscribe",
+  "unsubscribe",
+  "newsletter",
+  "marketing",
+  "promotional",
+  "promotions",
+  "email me",
+  "email updates",
+  "send me email",
+  "send me updates",
+  "text me",
+  "sms me",
+  "contact me by phone",
+  "contact me by email",
+  "call me",
+  "contact me about",
+  "agree to be contacted",
+  "agree to receive",
+  "agree to the privacy policy",
+  "agree to the terms",
+  "agree to the terms of service",
+  "i agree to the terms",
+  "i consent",
+  "consent to",
+  "permission to contact",
+  "permission to email",
+  "share my information",
+  "share my data",
+  "share my resume",
+  "allow the employer",
+  "allow employers",
+  "may we",
+  "can we contact",
+  "do you agree",
+  "would you like to receive",
+  "would you like us to contact",
+  "keep me posted",
+  "follow up with me"
+];
+
+// Only standalone checkboxes go through here. A grouped checkbox list or radio
+// group ("Which of these may we use?") is answered by matching against the real
+// offered options, and refuses to answer if nothing matches (see the
+// answerMatchesOptions drop in matchFields), so it never reaches the filler with
+// a value it should not have. A lone box has no such safety net.
+function isConsentCheckbox(field) {
+  if (!field) return false;
+  const type = String(field.inputType || "").toLowerCase();
+  if (type !== "checkbox") return false;
+  if (field.tagName === "radiogroup") return false;
+
+  const label = normalizeLabel(field.label);
+
+  // No label at all is not permission to guess.
+  if (!label) return true;
+
+  for (const phrase of CONSENT_CHECKBOX_PHRASES) {
+    if (label.includes(phrase)) return true;
+  }
+
+  // A bare "[ ] I agree" with the obligation sitting in an adjacent heading is
+  // the same consent gesture with the label text somewhere else on the DOM.
+  return /^i agree$/.test(label) || /^agree$/.test(label) || /^accept$/.test(label);
+}
+
+// A consent box keeps its label — the review UI shows that, so the user can see
+// which question was declined and tick it themselves — but is given no value and
+// no matchedPath. Blanking the path matters as much as blanking the value: the
+// path is what the row's status is derived from and what the review UI reads as
+// "this was answered from your profile", and neither may be true here.
+function suppressConsentCheckbox(row) {
+  return {
+    ...row,
+    matchedPath: "",
+    value: "",
+    values: [],
+    status: "unmatched",
+    include: false,
+    consent: true
+  };
+}
+
 // What kind of control a field is, for the purpose of filing a learned rule:
 // "choice" for the option lists, "text" for everything that takes a typed value.
 // The tag rather than the exact element, because the same question is a
@@ -108,12 +214,46 @@ function findLearnedMatch(normalizedLabel, field, learned) {
 // as a flat list of non-empty strings. Returned to the filler so a single
 // answer can satisfy differently-worded options on different platforms
 // (see the `answers` comment in schema.js). Empty when the profile holds a
-// plain string or nothing at all.
+// plain string or nothing at all — except personal.country, which also
+// carries the country's calling code so a phone form's dial-code select
+// ("+91") is satisfiable by the same answer.
+//
+// The NANP countries share "+1", so their bare digit is deliberately
+// absent: "1" as a last-resort match could tick Canada for a United
+// States answer (and vice versa) whenever the list sorts the wrong one
+// first. A country one dial code names alone gets its bare form too,
+// because some lists show nothing else ("91", "44").
+const COUNTRY_DIAL_CODES = {
+  india: ["+91", "91"],
+  "united states": ["+1"],
+  "united states of america": ["+1"],
+  usa: ["+1"],
+  canada: ["+1"],
+  "united kingdom": ["+44", "44"],
+  uk: ["+44", "44"],
+  australia: ["+61", "61"],
+  germany: ["+49", "49"],
+  singapore: ["+65", "65"],
+  uae: ["+971", "971"],
+  "united arab emirates": ["+971", "971"]
+};
+
 function acceptedValues(profile, dictEntry) {
   if (!dictEntry) return [];
   const raw = getByPath(profile, dictEntry.path);
-  if (!Array.isArray(raw)) return [];
-  return raw.map((v) => String(v ?? "").trim()).filter(Boolean);
+  const values = Array.isArray(raw)
+    ? raw.map((v) => String(v ?? "").trim()).filter(Boolean)
+    : [];
+
+  if (dictEntry.path === "personal.country") {
+    const codes =
+      COUNTRY_DIAL_CODES[String(raw ?? "").trim().toLowerCase()] || [];
+    for (const code of codes) {
+      if (!values.includes(code)) values.push(code);
+    }
+  }
+
+  return values;
 }
 
 // Everything a multi-select checklist can legitimately match on: the skills
@@ -379,5 +519,19 @@ function matchFields(scannedFields, profile, learned) {
       status: resolvedStatus,
       include: resolvedStatus !== "unmatched"
     };
+  }).map((row, i) => {
+    // Last gate before the review UI, and before anything can reach the filler.
+    //
+    // Deliberately applied to the assembled row rather than to the field, so
+    // that every route to a value is covered at once: the bundled dictionary, an
+    // approved learned rule, and a multi-select resolution alike. A consent box
+    // arrives here as an ordinary unmatched row with the label intact, which is
+    // what the user needs to see to tick it themselves.
+    //
+    // Only standalone checkboxes qualify (see isConsentCheckbox), so this does
+    // not touch a "Which of these?" checklist.
+    return isConsentCheckbox(scannedFields[i])
+      ? suppressConsentCheckbox(row)
+      : row;
   });
 }

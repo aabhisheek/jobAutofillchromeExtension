@@ -142,13 +142,19 @@ const FIELD_DICTIONARY = [
   // "mail id" / "email id" are how the same field is labelled across Indian
   // forms, which favour the local spelling over "Email".
   { path: "personal.email", sensitive: false, phrases: ["email", "e mail", "mail id", "email id", "email address"] },
+  // A dial-code select beside the phone number is a country question wearing
+  // a different label: it wants "India" (or its "+91", see acceptedValues in
+  // matcher.js), not the number itself. The entry sits above personal.phone
+  // because "Phone country code" contains "phone" and would otherwise resolve
+  // to the number — the same ordering reason the long ATS questions sit at the
+  // top of this array.
+  { path: "personal.country", sensitive: false, phrases: ["country", "country code", "dial code", "isd code"] },
   // "contact no" abbreviates "contact number", which whole-word matching cannot
   // see through — "contact no" is not the phrase "contact number".
   { path: "personal.phone", sensitive: false, phrases: ["phone", "mobile", "contact number", "contact no", "telephone"] },
   { path: "personal.address", sensitive: false, phrases: ["address line", "street address", "address"] },
   { path: "personal.city", sensitive: false, phrases: ["city", "town"] },
   { path: "personal.state", sensitive: false, phrases: ["state", "province", "region"] },
-  { path: "personal.country", sensitive: false, phrases: ["country"] },
   { path: "personal.zip", sensitive: false, phrases: ["zip", "postal code"] },
   { path: "links.linkedin", sensitive: false, phrases: ["linkedin"] },
   { path: "links.github", sensitive: false, phrases: ["github"] },
@@ -293,6 +299,15 @@ const DEFAULT_SETTINGS = {
   // "Chrome Extension". It is not a secret and it is the one field that has to
   // be copied from a Google Cloud project before anything else here can run.
   gmailClientId: "",
+  // Only needed by Google Cloud "Web application" client ids, whose token
+  // endpoint rejects the exchange with `client_secret is missing`. A
+  // "Chrome Extension" client id has no secret and leaves this blank.
+  //
+  // Treat it as a public value, which is Google's own position for installed
+  // apps: "…you embed in the source code of your application. (In this context,
+  // the client secret is obviously not treated as a secret.)" It is kept in
+  // chrome.storage.local so it never reaches this repository, which is public.
+  gmailClientSecret: "",
   // The Gmail search the daily sync runs. A raw Gmail query, so the user can
   // tune it to the exact phrasing their target employers send. The default
   // covers the phrasing that actually shows up in confirmation mails across
@@ -309,9 +324,17 @@ const DEFAULT_SETTINGS = {
   // Chrome alarms only fire while the browser is running; an alarm that was
   // missed is not replayed, which is why the panel also offers Sync now.
   emailSyncTime: "09:00",
-  // Off by default: importing an inbox is a deliberate grant of access to the
-  // user's mail, not something this extension should start doing on update.
-  emailSyncEnabled: false,
+  // How often the background check runs: "1h", "2h" or "daily" (at the
+  // emailSyncTime above, which also anchors the interval schedules' first
+  // run). Every-hour is cheap — a check with nothing new in it makes zero AI
+  // calls, and the ledger means only genuinely new messages are ever read.
+  emailSyncEvery: "2h",
+  // On by default once the extension is installed: the daily check, the
+  // startup catch-up and the dashboard's own check all read this, and each of
+  // them is inert until Gmail is connected — which is the deliberate grant
+  // (an OAuth consent click), not this flag. The panel's checkbox turns the
+  // background schedule off without giving up the connection.
+  emailSyncEnabled: true,
   // Let the configured AI provider turn the subject / sender / snippet into a
   // clean {title, company, status}. Off falls back to the purely local parse,
   // which is free and never leaves the machine.
@@ -323,7 +346,29 @@ const DEFAULT_SETTINGS = {
   // How many days of mail a sync looks at. The query's own newer_than: term is
   // the real bound; this is the belt-and-braces one, and it also stops a
   // hand-edited query that dropped its date filter from importing a decade.
-  emailLookbackDays: 30
+  emailLookbackDays: 30,
+
+  // ---- job discovery -------------------------------------------------
+  // The roles the user wants to be found. Each one becomes a jobs search on
+  // LinkedIn (and other boards), and the results are scored against the
+  // profile before the best few land on the board. Empty means "fall back to
+  // the titles in the profile's experience", so the feature works before
+  // anyone fills in a single field.
+  discoverRoles: [],
+  // Optional location filter for those searches, "Bangalore, India" style.
+  // Empty searches everywhere the board defaults to.
+  discoverLocations: "",
+  // How many matched jobs a run may put on the board. 20 is a day's worth of
+  // triage; a bigger number is a longer list to scroll, not more applications.
+  discoverMaxJobs: 20,
+  // Run automatically when the dashboard opens — throttled to once every
+  // AUTO_INTERVAL so a frequently-reopened board does not hammer job sites
+  // with tabs. The button runs regardless.
+  discoverAuto: true,
+  // Score the shortlist chance with the configured AI provider when there is
+  // one. Off (or unconfigured) still yields the local match score and stars;
+  // this only replaces the "chance of shortlist" number and adds reasons.
+  discoverUseAi: true
 };
 
 // Extensions accepted for the bundled context file. Plain text only: the

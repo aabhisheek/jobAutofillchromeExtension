@@ -63,7 +63,10 @@ function makeChrome({ storage, overrides } = {}) {
     },
     permissions: { async request() { return true; } },
     identity: {
-      getRedirectURL: () => "https://testextensionid.chromiumapp.org/oauth2",
+      // Mirrors Chrome: the optional path is appended to the origin. Honouring the
+      // argument matters, because the redirect_uri regression this file guards is
+      // entirely about whether a path is present.
+      getRedirectURL: (p) => `https://testextensionid.chromiumapp.org/${p || ""}`,
       launchWebAuthFlow: async () => "https://testextensionid.chromiumapp.org/?code=fake"
     },
     alarms: {
@@ -89,7 +92,12 @@ function makeContext(extra = {}) {
     TextDecoder, TextEncoder, Uint8Array,
     URL, URLSearchParams,
     fetch: (extra.chrome || makeChrome()).fetch,
-    document: extra.document,
+    crypto,
+    // `document` is opt-in and deliberately not defaulted to a stub. A lib that
+    // reaches for the DOM must fail loudly here: src/lib/gmail.js runs in the
+    // service worker, where `document` is genuinely undefined, and a test that
+    // quietly supplied one would hide exactly that class of bug.
+    ...(extra.document === undefined ? {} : { document: extra.document }),
     setTimeout, clearTimeout,
     Date, Math, JSON, RegExp,
     String, Number, Boolean, Object, Array, Promise, Error, Map, Set,

@@ -146,6 +146,11 @@ function normalizeApplication(input, previous = {}) {
   const base = { ...previous, ...input };
   const status = APPLICATION_STATUSES.includes(base.status) ? base.status : "saved";
   const now = Date.now();
+  // The moment the event this input describes actually happened: the email's
+  // own date when the input came from the importer, the clock otherwise. It is
+  // deliberately not persisted — appliedAt / rejectedAt are — so a later save
+  // with no mail behind it can never re-stamp a row with a stale import time.
+  const eventAt = Number.isFinite(base.emailAt) ? base.emailAt : now;
 
   const application = {
     id: base.id || makeId(),
@@ -160,8 +165,18 @@ function normalizeApplication(input, previous = {}) {
     // as already imported instead of becoming a second card, which a URL
     // cannot always do because confirmation mails often carry no job link.
     sourceEmailId: String(base.sourceEmailId || "").trim(),
+    // The discovery rating, when the card came from the job finder: { pct,
+    // stars, shortlist, reasons, scoredAt }. Kept as-is rather than
+    // recomputed, so the board shows the number the run actually decided —
+    // and a later save with no rating behind it leaves it untouched.
+    match: base.match && typeof base.match === "object" ? base.match : null,
     savedAt: Number.isFinite(base.savedAt) ? base.savedAt : now,
     appliedAt: Number.isFinite(base.appliedAt) ? base.appliedAt : null,
+    // When the rejection arrived — the rejection email's date for an imported
+    // row, the moment of the manual move otherwise. The board shows this in
+    // place of the applied date while the card sits in Rejected, so the card
+    // answers "when did this outcome happen" instead of "when was it synced".
+    rejectedAt: Number.isFinite(base.rejectedAt) ? base.rejectedAt : null,
     updatedAt: now
   };
 
@@ -177,7 +192,8 @@ function normalizeApplication(input, previous = {}) {
   // "Applied this week" is otherwise unanswerable for a job tracked from the
   // start. Moving back off applied keeps the original stamp, so the weekly count
   // doesn't quietly forget an application the user really did send.
-  if (status !== "saved" && !application.appliedAt) application.appliedAt = now;
+  if (status !== "saved" && !application.appliedAt) application.appliedAt = eventAt;
+  if (status === "rejected" && !application.rejectedAt) application.rejectedAt = eventAt;
   return application;
 }
 
@@ -249,11 +265,14 @@ function findByTitleCompany(items, title, company) {
 // walk a row backwards: an auto-reply arriving after a user moved a job to
 // Interview cannot drag it back to Applied, and a "we have no longer moved
 // forward" mail for one role cannot demote a different row's offer.
-const STATUS_RANK = { saved: 0, applied: 1, rejected: 1, interview: 2, offer: 3 };
+const STATUS_RANK = { saved: 0, applied: 1, rejected: 2, interview: 3, offer: 4 };
 
-// Rejected ranks level with applied on purpose: it is a real outcome of having
-// applied, not a lesser one, so the only thing this guards is the two stages
-// above Applied.
+// Rejected sits above applied and below the two live stages: a rejection mail
+// is the outcome that follows an application, so it must be able to move an
+// Applied card to Rejected (and carry its date with it), while still never
+// being able to demote an interview or an offer. The mirror rule falls out of
+// the same ordering — a stale "application received" mail cannot un-reject a
+// card either. The only thing this guards is the two stages above Rejected.
 function shouldAdoptStatus(currentStatus, incomingStatus) {
   if (!APPLICATION_STATUSES.includes(incomingStatus)) return false;
   if (!APPLICATION_STATUSES.includes(currentStatus)) return true;
@@ -456,7 +475,7 @@ function csvCell(value) {
 }
 
 function toCsv(items) {
-  const header = ["Title", "Company", "Status", "Source", "URL", "Saved", "Applied", "Updated", "Notes"];
+  const header = ["Title", "Company", "Status", "Source", "URL", "Saved", "Applied", "Rejected", "Updated", "Notes"];
   const rows = items.map((item) => [
     item.title,
     item.company,
@@ -465,6 +484,7 @@ function toCsv(items) {
     item.url,
     isoOrEmpty(item.savedAt),
     isoOrEmpty(item.appliedAt),
+    isoOrEmpty(item.rejectedAt),
     isoOrEmpty(item.updatedAt),
     item.notes
   ]);

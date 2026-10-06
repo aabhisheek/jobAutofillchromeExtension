@@ -315,10 +315,11 @@ async function handlePanelRequest(tab) {
   await openPanel(tab);
 }
 
-// ---- daily email sync ---------------------------------------------------
+// ---- scheduled email sync ------------------------------------------------
 //
-// One chrome.alarms alarm runs MailImport.runSync() once a day at the time the
-// dashboard panel was configured for.
+// One chrome.alarms alarm runs MailImport.runSync() on the schedule the
+// dashboard panel was configured for: hourly, every two hours, or once a day
+// at a chosen time.
 //
 // chrome.alarms rather than an OS scheduler (launchd/cron/Task Scheduler)
 // because the thing that has to happen is a fetch() from a service worker that
@@ -335,9 +336,13 @@ const EMAIL_ALARM = "job-email-sync";
 // The only settings fields that change when the alarm should fire. Compared by
 // key on a storage event, so flipping an unrelated preference does not re-arm a
 // timer the user did not touch.
-const EMAIL_SCHEDULE_FIELDS = ["emailSyncEnabled", "emailSyncTime"];
+const EMAIL_SCHEDULE_FIELDS = ["emailSyncEnabled", "emailSyncTime", "emailSyncEvery"];
 
 const DAY_MINUTES = 1440;
+
+// Background schedules, in minutes. Anything not in here — including a missing
+// or hand-edited value — falls back to the daily alarm.
+const SYNC_INTERVAL_MINUTES = { "1h": 60, "2h": 120 };
 
 // "HH:MM" in the machine's local zone. Returns null for anything else, so a
 // half-typed value in the time input falls back to the previous schedule rather
@@ -366,7 +371,32 @@ function nextRunAt(time, from = Date.now()) {
   return next.getTime();
 }
 
+// Next firing of an interval schedule (hourly / every two hours), anchored on
+// the last completed run. Deterministic in (lastAt, period, from) so that the
+// worker — which reconciles on every start, i.e. constantly — recomputes the
+// same future instant instead of pushing the alarm forward each time it wakes
+// (which would starve a `when: now + period` schedule forever). A last run far
+// enough in the past lands on the next multiple of the period ahead, so a
+// browser that was closed for a day catches up within one period rather than
+// replaying every missed one. Returns null when there is no last run: the
+// caller then falls back to the daily anchor, which is a fixed wall-clock
+// time and therefore safe to recompute the same way.
+function nextIntervalRunAt(lastAt, periodMinutes, from = Date.now()) {
+  const period = Math.max(1, Number(periodMinutes) || 60) * 60000;
+  if (!Number.isFinite(lastAt) || lastAt <= 0) return null;
+  const missed = Math.floor((from - lastAt) / period);
+  return lastAt + (Math.max(0, missed) + 1) * period;
+}
+
 async function scheduleEmailSync(settings) {
+  const period = SYNC_INTERVAL_MINUTES[settings.emailSyncEvery];
+  if (period) {
+    const state = await MailImport.readSyncState().catch(() => null);
+    const next = nextIntervalRunAt(state && state.at, period) || nextRunAt(settings.emailSyncTime);
+    await chrome.alarms.create(EMAIL_ALARM, { when: next, periodInMinutes: period });
+    return next;
+  }
+
   const next = nextRunAt(settings.emailSyncTime);
   await chrome.alarms.create(EMAIL_ALARM, {
     when: next,
@@ -406,7 +436,7 @@ async function reconcileEmailAlarm() {
     }
     return await scheduleEmailSync(settings);
   } catch {
-    // Best-effort: a missing alarm costs one day of imports, and the panel's
+    // Best-effort: a missing alarm costs a scheduled run, and the panel's
     // Sync now button still works.
     return null;
   }
@@ -418,7 +448,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   // The panel runs the sync itself rather than asking this worker to, so it can
   // show progress as messages arrive. These messages are for the parts that have
-  // to happen here: the daily alarm, and re-arming it after a settings change.
+  // to happen here: the sync alarm, and re-arming it after a settings change.
   if (message.type === "mail:sync") {
     if (message.run) {
       sendResponse({ accepted: true });
@@ -497,6 +527,13 @@ chrome.runtime.onInstalled.addListener(async ({ reason, previousVersion }) => {
 chrome.runtime.onStartup.addListener(() => {
   flush().catch(() => {});
   reconcileEmailAlarm();
+  // Chrome does not replay an alarm the browser slept through, and the browser
+  // has only just opened — this is the natural moment to catch up on yesterday's
+  // mail instead of waiting for the scheduled hour. Gated on the same setting
+  // the alarm is, so a refused run never rewrites the panel's last-run line.
+  MailImport.loadSettings()
+    .then((settings) => (settings.emailSyncEnabled ? runEmailSync() : null))
+    .catch(() => {});
 });
 flush().catch(() => {});
 
@@ -504,7 +541,7 @@ flush().catch(() => {});
 // live on the session, not the worker, and MV3 tears this worker down often.
 applyPanelState().catch(() => {});
 
-// Same for the daily alarm: Chrome persists alarms across restarts, but the
-// time the user wants lives in storage and is edited from a page while this
+// Same for the sync alarm: Chrome persists alarms across restarts, but the
+// schedule the user wants lives in storage and is edited from a page while this
 // worker sleeps. Reconciling here is what makes the two agree.
 reconcileEmailAlarm().catch(() => {});

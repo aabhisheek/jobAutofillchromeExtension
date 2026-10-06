@@ -4,9 +4,11 @@
   "private": true,
   "description": "Job Application Autofill Chrome extension (Manifest V3, no build step).",
   "scripts": {
-    "test": "node --test --test-reporter=spec tests/",
-    "test:watch": "node --test --watch tests/",
-    "test:ci": "node --test --test-reporter=spec tests/"
+    "test": "npm run test:harness && npm run test:unit",
+    "test:harness": "node tests/run.js",
+    "test:unit": "node --test --test-reporter=spec",
+    "test:watch": "node --test --watch",
+    "test:ci": "npm test"
   },
   "engines": {
     "node": ">=20"

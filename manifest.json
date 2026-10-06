@@ -30,6 +30,14 @@
     "https://gmail.googleapis.com/*",
     "https://oauth2.googleapis.com/*"
   ],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["src/content/autodetect.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
   "background": {
     "service_worker": "src/background.js"
   },

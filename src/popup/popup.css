@@ -131,6 +131,71 @@ button:hover { background: var(--bg-hover); }
 }
 #scan-btn:hover, #fill-btn:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 
+/* Fill and Next sit side by side: the whole loop is fill, look, continue, and a
+   full-width pair stacked above each other makes the second step feel like
+   somewhere else on the panel. Both grow to share the row equally so neither
+   looks like the primary action and the other a footnote. */
+.fill-actions {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0;
+}
+.fill-actions #fill-btn,
+.fill-actions #next-btn {
+  flex: 1 1 0;
+  width: auto;
+  margin: 0;
+  padding: 8px 10px;
+}
+
+/* Deliberately not the accent fill. Next Step moves the application forward, so
+   it reads as a secondary action until the page is actually ready — at which
+   point it turns into the accent below. The colour is the whole feedback loop:
+   grey means "not yet", and a user who learns that stops clicking it early. */
+#next-btn {
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  font-weight: 600;
+}
+#next-btn:hover:not(:disabled) { background: var(--bg-hover); }
+
+#next-btn.ready {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+#next-btn.ready:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+/* The amber the warning line already uses, so the button and the sentence under
+   it read as one message rather than as a normal Next button and an unrelated
+   note. */
+#next-btn.ready.submitting {
+  background: var(--warning-border, #d97706);
+  border-color: var(--warning-border, #d97706);
+}
+#next-btn.ready.submitting:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+#next-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* The forward control on this step will SUBMIT the application, not advance to
+   another one. Shown as its own line rather than folded into the button's label
+   because the label has to stay short enough not to reflow the button row, and
+   because "this click is irreversible" deserves to be stated in words rather than
+   implied by a colour. */
+.submit-warning {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--warning-border, #d97706);
+  border-radius: var(--radius);
+  background: var(--warning-bg, #fff7ed);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 /* Shown only when this site's origin has not been granted yet. Deliberately
    amber rather than red: nothing is broken, the panel just cannot read the
    page until the user agrees to let it. */

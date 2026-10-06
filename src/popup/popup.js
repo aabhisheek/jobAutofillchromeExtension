@@ -53,6 +53,103 @@ let currentTabOrigin = null;
 let currentTabHost = "";
 let hasHostAccess = false;
 
+// Fields the last fill pass could not set, as { uid, label, reason, consent }.
+//
+// Panel-side state rather than something re-derived from the page, because the
+// page cannot tell what the panel tried: a consent checkbox the filler
+// deliberately skipped looks identical on the DOM to one that was never seen.
+// Kept between passes so Next can refuse while a failed field is still failed,
+// and cleared by the fill that follows an advance since those fields belong to a
+// step that no longer exists.
+let lastFillFailures = [];
+
+// The last verdict from probeAdvanceReady(), kept only so the click handler can
+// tell "refused, and here's why" from "the probe could not reach the page".
+let lastAdvanceVerdict = null;
+
+// ---- automatic scanning ----
+//
+// The panel refreshes itself: a content script (manifest content_scripts,
+// src/content/autodetect.js) reports from every http(s) page when its form
+// controls change, and the tabs listeners follow the user across tabs and
+// navigations. The Scan button stays, but it is no longer required for the
+// review list to be on screen. Fill and the AI resolve stay one click each,
+// on purpose — only the scan is automatic.
+//
+// One debounce timer for all triggers: a navigation fires the tabs listener
+// and the content script's own report within the same window, and two scans
+// in a row would render the same list twice.
+const AUTO_SCAN_DEBOUNCE_MS = 600;
+// After a fill, the page has just been written to and the rows show what the
+// fill did. A content-script report caused by that same write would re-render
+// the rows back to "matched", so automatic rescans hold off briefly after a
+// fill. Manual scans and the post-advance rescan are not affected.
+const FILL_QUIET_MS = 5000;
+
+let autoScanTimer = null;
+let pendingAutoReason = null;
+// When the most recent automatic trigger arrived, and when the scan currently
+// running started. A trigger older than the running scan is already covered
+// by it — without this, opening the panel would queue a second scan of an
+// unchanged page every time.
+let lastAutoTriggerAt = 0;
+let scanStartedAt = 0;
+
+// The scan in flight, if any. handleScan() joins it rather than starting a
+// competitor: two interleaved retry loops would both render rows and the last
+// to finish would win arbitrarily.
+let scanInFlight = null;
+// Set when a trigger arrives after the running scan started — that scan may
+// have read the page before the change, so another one follows it.
+let autoScanQueued = false;
+
+// Edits the user has typed into the review list since the last scan rendered
+// it. They live in currentRows, but an automatic rescan fetches fresh rows
+// from the page and would discard them, so a content-script report is skipped
+// (with a note) while this is set. Cleared when a scan replaces the rows, and
+// on tab switches and navigations, where the old rows are irrelevant anyway.
+let rowsDirty = false;
+
+// Set by handleFill; see FILL_QUIET_MS.
+let lastFillAt = 0;
+
+function markRowsDirty() {
+  rowsDirty = true;
+}
+
+function scheduleAutoScan(reason) {
+  pendingAutoReason = reason || "auto";
+  lastAutoTriggerAt = Date.now();
+  if (autoScanTimer) clearTimeout(autoScanTimer);
+  autoScanTimer = setTimeout(() => {
+    autoScanTimer = null;
+    runAutoScan();
+  }, AUTO_SCAN_DEBOUNCE_MS);
+}
+
+async function runAutoScan() {
+  const reason = pendingAutoReason || "auto";
+  pendingAutoReason = null;
+
+  if (Date.now() - lastFillAt < FILL_QUIET_MS) return;
+
+  if (scanInFlight) {
+    if (scanStartedAt >= lastAutoTriggerAt) return;
+    autoScanQueued = true;
+    return;
+  }
+
+  if (!currentProfile) return;
+
+  if (rowsDirty) {
+    document.getElementById("scan-status").textContent =
+      "The page changed while you were editing — press Scan to refresh (your edits will be cleared).";
+    return;
+  }
+
+  await handleScan(reason);
+}
+
 function originPatternFor(url) {
   try {
     const { origin, hostname } = new URL(url);
@@ -365,6 +462,12 @@ function renderRows(rows) {
         : row.status === "unmatched";
     checkbox.addEventListener("change", () => {
       currentRows[idx].include = checkbox.checked;
+
+      // Unticking a field is a decision about what the extension may touch, and
+      // the Next button's state depends on exactly that. Recomputed on every
+      // toggle rather than only on fill, so unticking the last thing standing
+      // between the panel and the next step lights the button up immediately.
+      syncNextButton();
     });
 
     const label = document.createElement("label");
@@ -522,6 +625,12 @@ const draftBtn = document.createElement("button");
   });
 
   document.getElementById("fill-bar").classList.remove("hidden");
+
+  // Now that there is a fill bar, work out whether the step can be advanced.
+  // Fire-and-forget: renderRows is called from several places, including the
+  // resolve and choice paths, and none of them should wait on a page injection
+  // to finish painting a row list.
+  syncNextButton();
 }
 
 // Placeholder text some dropdown widgets (react-select, Workday select
@@ -598,6 +707,18 @@ function splitFrameUid(uid) {
 const FRAME_POLL_MS = 150;
 const FRAME_STABLE_POLLS = 2;
 
+// How long a shortfall — fewer frames reporting than the tree declares — has to
+// hold still before it is believed. A frame on its way changes the signature
+// when it arrives (or reports readyState "loading" if it can report at all), so
+// a shortfall that survives this many identical polls is a frame that will
+// never show: an about:blank widget frame Chrome churns, an embed the frame
+// tree counts but that has already gone. Without this, every such page burned
+// the full readFrames deadline and then reported "still rendering" — which on
+// a page whose fields are elsewhere sent the scan into six fruitless rescans.
+// 7 polls at 150ms is ~1s: long enough to catch a slow cross-process attach,
+// a fifth of the old worst case.
+const FRAME_SHORTFALL_POLLS = 7;
+
 // What changed between two samples of the frame tree. Counts and load state
 // only, never contents, so nothing read off the page leaves here.
 function frameSignature(frames) {
@@ -607,7 +728,8 @@ function frameSignature(frames) {
 }
 
 // Every frame that should exist is reporting, none is still parsing, and the
-// counts have held still.
+// counts have held still — or the shortfall itself has held still long enough
+// that no frame is on its way any more (see FRAME_SHORTFALL_POLLS).
 function framesAreSettled(frames, stable) {
   // The top document plus one per <iframe> declared anywhere in the tree. A
   // frame that has not finished loading cannot report anything about itself, so
@@ -615,9 +737,9 @@ function framesAreSettled(frames, stable) {
   const expected = 1 + frames.reduce((total, frame) => total + (frame.frames || 0), 0);
 
   return (
-    frames.length >= expected &&
     frames.every((frame) => frame.readyState !== "loading") &&
-    stable >= FRAME_STABLE_POLLS
+    stable >= FRAME_STABLE_POLLS &&
+    (frames.length >= expected || stable >= FRAME_SHORTFALL_POLLS)
   );
 }
 
@@ -727,6 +849,25 @@ async function scanFrame(tabId, frame, adapter, scanOptions) {
 }
 
 async function scanCurrentTab(tabId, scanOptions = {}) {
+
+  // Drop the previous pass's marks before reading anything.
+  //
+  // Every fill leaves the page showing which fields were outstanding. Once the
+  // user starts fixing them by hand, those marks are stale in the worst way:
+  // they point at fields that are already correct, and the highlight's whole job
+  // is to be trusted as "this one is not done yet".
+  //
+  // Scanning is the moment to clear, not filling, because it is the point the
+  // user has decided the previous answer is no longer current — whether because
+  // they moved on, finished the step, or just want to look again. Clearing is
+  // per frame and best-effort: a frame that has gone away needs no clearing, and
+  // must not stop the others from being cleared.
+  await Promise.all(
+    currentFrames.map((frame) =>
+      injectIntoFrame(tabId, frame.frameId, highlightReviewFields, [{ uids: [] }])
+        .catch(() => null)
+    )
+  );
 
   // Frames first, because the form is frequently not in the top document and a
   // frame that is still loading scans as a short but entirely well-formed
@@ -1025,8 +1166,44 @@ function describeEmptyScan(probe, attempts) {
   return `No fillable fields found${retryNote} — ${bits.join(" · ")}.`;
 }
 
-async function handleScan() {
+// Every scan — the button, the automatic rescans, and the post-advance rescan —
+// goes through here. A call while one is running joins the running scan
+// instead of starting a second one; a trigger that arrives after that scan
+// started is queued by runAutoScan() and follows it.
+function handleScan(trigger) {
+  if (scanInFlight) return scanInFlight;
+
+  scanStartedAt = Date.now();
+  const running = performScan(trigger || "manual");
+  scanInFlight = running;
+  running.finally(() => {
+    scanInFlight = null;
+    if (autoScanQueued) {
+      autoScanQueued = false;
+      scheduleAutoScan(pendingAutoReason || "auto:queued");
+    }
+  });
+  return running;
+}
+
+async function performScan(trigger) {
   const status = document.getElementById("scan-status");
+
+  const startedAt = performance.now();
+
+  const tab = await getActiveTab();
+  if (!tab || !tab.id) {
+    status.textContent = "No active tab found.";
+    return;
+  }
+
+  // The tab under the panel can change between scans now that scans also run
+  // automatically (tab switches, navigations), so the platform, the adapter,
+  // and host access are re-derived here from the tab actually being scanned
+  // rather than trusted from init().
+  currentAts = atsVendor(tab.url);
+  currentAdapter = AtsRegistry.resolve(tab.url);
+  await refreshHostAccess(tab);
 
   // Host access is declarative (manifest host_permissions), so Chrome grants it
   // at install and there is normally nothing to do here. This check only catches
@@ -1038,14 +1215,7 @@ async function handleScan() {
     return;
   }
 
-  const startedAt = performance.now();
   status.textContent = "Scanning…";
-
-  const tab = await getActiveTab();
-  if (!tab || !tab.id) {
-    status.textContent = "No active tab found.";
-    return;
-  }
 
   try {
     let rows = await scanCurrentTab(tab.id);
@@ -1084,6 +1254,10 @@ async function handleScan() {
       ? `${rows.length} fields found — ${autoCount} auto, ${reviewCount} need review, ${unmatchedCount} unmatched.`
       : describeEmptyScan(probe, attempt);
 
+    // The fresh rows replace whatever was on screen, edits and all — which is
+    // the point of a manual rescan and the reason an automatic one was held
+    // off while rowsDirty was set.
+    rowsDirty = false;
     renderRows(precheckFilled(rows));
 
     // The platform the form itself lives on, which need not be the platform of
@@ -1095,6 +1269,10 @@ async function handleScan() {
 
     Analytics.trackTimed("Form Scanned", startedAt, {
       ats: currentAts,
+      // "manual" for the button; "auto:<reason>" for the automatic paths
+      // (panel-open, tab-switch, navigation, form-detected, queued), so a
+      // scan the user never asked for is distinguishable in the funnel.
+      trigger,
       ats_frame: formFrame ? atsVendor(formFrame.origin) : "unknown",
       field_count: rows.length,
       auto_count: autoCount,
@@ -1119,7 +1297,7 @@ async function handleScan() {
     });
   } catch (err) {
     status.textContent = `Could not scan this page: ${err.message}`;
-    Analytics.trackTimed("Form Scan Failed", startedAt, { ats: currentAts, error: err.message });
+    Analytics.trackTimed("Form Scan Failed", startedAt, { ats: currentAts, trigger, error: err.message });
   }
 }
 
@@ -1385,8 +1563,294 @@ async function suggestChoice(row, idx, buttonEl, startedAt) {
   });
 }
 
+// Whether a row is one the user has to deal with by hand on the page, as opposed
+// to one this extension handled.
+//
+// Only rows that were never eligible in the first place. A row the user unticked
+// is their decision, not an outstanding item — marking it would mean nagging
+// about a field they just deliberately excluded, and a highlight that nags about
+// deliberate choices is a highlight the user learns to ignore.
+//
+// What lands here: fields the dictionary could not name, resume uploads with no
+// PDF stored, consent checkboxes (which matcher.js deliberately leaves
+// unmatched), and anything the filler failed to set.
+function rowNeedsHands(row) {
+  if (row.include) return false;
+  return row.status !== "auto" && row.status !== "review";
+}
+
+// ============================================================
+// IS THE NEXT STEP BUTTON GOING TO WORK?
+// ============================================================
+//
+// Asked before the button is ever clicked, so the panel can say "not yet, 2
+// fields need you" rather than letting the user click, watch nothing happen, and
+// conclude the extension is broken.
+//
+// This is a cheap panel-side guess, not the authority. It cannot know what the
+// page considers required, because that lives in the DOM it has not read yet, so
+// advanceStep() re-checks on the page and refuses independently if the page
+// disagrees. The point of asking here first is only that a refusal we can predict
+// costs the user nothing.
+//
+// Two things are deliberately NOT treated as blocking, because each one produces
+// a button that is permanently grey and therefore never gets used:
+//
+//   - Consent checkboxes. Leave one to the user and this panel would refuse to
+//     ever advance. The page's own disabled button is the honest signal there.
+//   - Unmatched optional fields. The dictionary not knowing a field does not mean
+//     the field is required, and plenty of forms carry optional questions the
+//     page will happily accept blank.
+//
+async function probeAdvanceReady() {
+  const tab = await getActiveTab();
+  if (!tab || !tab.id) return { ready: false, reason: "No page to advance." };
+
+  const rows = currentRows;
+  const outstanding = rows.filter(rowNeedsHands).filter((r) => !r.consent);
+
+  // Fields the filler tried and failed to set, which is a stronger signal than
+  // "unmatched": the extension had an answer and the page rejected it, so this is
+  // very likely a required field.
+  const failed = lastFillFailures.filter((f) => !f.consent);
+
+  const probe = await injectIntoFrame(tab.id, 0, advanceStep, [
+    pageConfigForFrame(0),
+    { dryRun: true }
+  ]).catch(() => null);
+
+  if (!probe) {
+    return { ready: false, reason: "Could not read this page." };
+  }
+
+  // advanceStep()'s own verdict is the one that matters.
+  if (!probe.ready) {
+    return { ready: false, reason: probe.reason };
+  }
+
+  if (outstanding.length || failed.length) {
+    const n = new Set([...outstanding.map((r) => r.uid), ...failed.map((f) => f.uid)]).size;
+    return {
+      ready: false,
+      reason: `${n} field${n === 1 ? "" : "s"} still need you — fill or untick ${n === 1 ? "it" : "them"} first.`
+    };
+  }
+
+  // isSubmit rides along because the panel has to be able to say what the click is
+  // about to do before it is offered. It is the page's own answer — which label
+  // its forward control carries — not an inference from how many steps have gone
+  // by, because a single-page form has no steps to count.
+  return { ready: true, label: probe.label, isSubmit: probe.isSubmit === true };
+}
+
+// Reflects the verdict on the button itself: grey and disabled when the step
+// cannot be advanced, accent when it can. Called after every action that can
+// change the answer — a scan, a fill, a row being unticked.
+//
+// Cheap and re-entrant by design. It re-runs the page probe each time, which is
+// one injection, and it must not throw out of a click handler: a failed probe
+// leaves the button in its last state rather than throwing.
+async function syncNextButton() {
+  const btn = document.getElementById("next-btn");
+  if (!btn) return;
+
+  const bar = document.getElementById("fill-bar");
+  if (bar.classList.contains("hidden")) return;
+
+  const warn = document.getElementById("submit-warning");
+
+  btn.disabled = true;
+  btn.classList.remove("ready");
+  btn.textContent = "Next Step";
+  btn.title = "";
+
+  if (warn) {
+    warn.classList.add("hidden");
+    warn.textContent = "";
+  }
+
+  try {
+    const verdict = await probeAdvanceReady();
+    lastAdvanceVerdict = verdict;
+
+    if (!verdict.ready) {
+      // No warning line for a refusal. The reason is already on the button's
+      // tooltip and, once clicked, in the status area — a second copy of "3 fields
+      // are empty" in amber would read as a new problem rather than the same one.
+      btn.title = verdict.reason || "";
+      return;
+    }
+
+    btn.disabled = false;
+    btn.classList.add("ready");
+
+    // One button, but it says which of the two things it is about to do.
+    //
+    // Labelling a submit "Next Step" would be a lie the user cannot see through
+    // until after the click; labelling every step's button "Submit" would train
+    // them to ignore the word. So the button names what THIS step's forward
+    // control actually says.
+    if (verdict.isSubmit) {
+      btn.textContent = "Submit Application";
+      btn.classList.add("submitting");
+      btn.title = `Click "${verdict.label}" on the page — this submits the application`;
+
+      if (warn) {
+        warn.textContent =
+          `This is the last step. "${verdict.label}" submits your application — check the answers before you click.`;
+        warn.classList.remove("hidden");
+      }
+    } else {
+      btn.textContent = "Next Step";
+      btn.classList.remove("submitting");
+      btn.title = verdict.label
+        ? `Click "${verdict.label}" on the page`
+        : "Advance to the next step";
+    }
+  } catch {
+    // Leave it disabled. A button that cannot verify the page is safe should not
+    // be clickable.
+  }
+}
+
+// Clicks Next on the page, then rescans — because a wizard step replaces the
+// entire field set, and the panel's rows describe the step just left behind.
+//
+// Reuses handleScan() rather than only refreshing the list, so the new step goes
+// through the same settle-and-rescan path as a first scan. A wizard swaps its
+// DOM asynchronously, so scanning immediately would usually catch it mid-render
+// and report zero fields.
+async function handleNext(buttonEl) {
+  const status = document.getElementById("fill-status");
+  const tab = await getActiveTab();
+  if (!tab || !tab.id) return;
+
+  // Asked again here rather than trusting the button's enabled state: the button
+  // is styled from a probe that may be seconds old, and the page may have become
+  // unready in between.
+  const verdict = await probeAdvanceReady();
+  if (!verdict.ready) {
+    status.textContent = verdict.reason || "Not advancing yet.";
+    await syncNextButton();
+    return;
+  }
+
+  // Whether this is the irreversible click, captured BEFORE the page changes —
+  // after it, the button found is the new step's and the answer is meaningless.
+  const isSubmit = verdict.isSubmit === true;
+  const submitLabel = verdict.label;
+
+  const startedAt = performance.now();
+  const previousLabel = status.textContent;
+  buttonEl.disabled = true;
+  buttonEl.textContent = isSubmit ? "Submitting…" : "Advancing…";
+  status.textContent = isSubmit ? `Clicking "${submitLabel}"…` : "Clicking Next…";
+
+  try {
+    const result = await injectIntoFrame(tab.id, 0, advanceStep, [
+      pageConfigForFrame(0),
+      {
+        outstandingCount: lastFillFailures.length,
+        outstandingUids: lastFillFailures.map((f) => f.uid)
+      }
+    ]);
+
+    if (!result || !result.ok) {
+      status.textContent =
+        (result && result.reason) || "Could not advance. Fill the step, then click Next yourself.";
+
+      if (result && result.blockers && result.blockers.length) {
+        for (const blocker of result.blockers) {
+          const line = document.createElement("span");
+          line.className = "fill-failure";
+          line.textContent = blocker;
+          status.appendChild(line);
+        }
+      }
+
+      Analytics.trackTimed("Advance Refused", startedAt, {
+        ats: currentAts,
+        blocker_count: (result && result.blockers && result.blockers.length) || 0,
+        // A refused submit is a different event from a refused step change: it
+        // means the application was nearly sent with something missing.
+        refused_submit: !!(result && result.isSubmit)
+      });
+      await syncNextButton();
+      return;
+    }
+
+    // Landed on a step the page considers valid, so the previous highlights are
+    // about a page that no longer exists. Cleared before the rescan, which would
+    // otherwise try to clear them against uids the new step has reused.
+    //
+    // On a submit this is also clearing a page that may no longer exist at all —
+    // the app has often been redirected to a confirmation screen by now — so the
+    // failure is expected and ignored.
+    await injectIntoFrame(tab.id, 0, highlightReviewFields, [{ uids: [] }]).catch(
+      () => null
+    );
+
+    // A submit that reports no page change is reported as such rather than as a
+    // success. It is usually still uploading, and the honest next action is to
+    // wait and look rather than click again — clicking twice on a real submit is
+    // how one application becomes two.
+    const moved = result.changed === true;
+
+    if (isSubmit) {
+      status.textContent = moved
+        ? `Clicked "${result.label}". Check the page — it should now show your application was submitted.`
+        : `Clicked "${result.label}" but the page has not responded yet. Wait and check before clicking again.`;
+
+      Analytics.trackTimed("Application Submitted", startedAt, {
+        ats: currentAts,
+        page_changed: moved,
+        // Whether the form was fully populated at the moment of submission. The
+        // one number worth having here: an application sent with unanswered
+        // required fields is the failure this feature could cause.
+        outstanding_rows: currentRows.filter(rowNeedsHands).length,
+        consent_boxes_left_to_user: currentRows.filter((r) => r.consent).length
+      });
+    } else {
+      status.textContent = moved
+        ? `Advanced past "${result.label}". Review the new step.`
+        : `Clicked "${result.label}", but the page did not change. Check the highlighted fields.`;
+
+      Analytics.trackTimed("Advanced Step", startedAt, {
+        ats: currentAts,
+        // Whether the page actually changed, as distinct from the click landing.
+        // A wizard that swallows the click is worth knowing about: it usually
+        // means the step had a validation error it did not surface.
+        page_changed: moved
+      });
+    }
+
+    // Both paths leave the button to syncNextButton(), which recomputes the
+    // label from whatever the new page offers. Setting it here would be a guess
+    // that is right exactly once.
+    buttonEl.disabled = false;
+
+    // A submit usually lands on a confirmation page with no form on it, so the
+    // rescan is expected to find nothing. That is not a failure worth a full
+    // re-render of the panel, but it is worth a scan for a wizard step.
+    await handleScan("auto:next");
+    await syncNextButton();
+  } catch (err) {
+    status.textContent = previousLabel || `Could not advance: ${err.message}`;
+    buttonEl.textContent = isSubmit ? "Submit Application" : "Next Step";
+    buttonEl.disabled = false;
+    Analytics.trackTimed(
+      isSubmit ? "Submit Failed" : "Advance Failed",
+      startedAt,
+      { ats: currentAts, error: err.message }
+    );
+  }
+}
+
 async function handleFill() {
   const status = document.getElementById("fill-status");
+  // The fill writes the page; see FILL_QUIET_MS — an automatic rescan right
+  // after would re-render the rows the fill just updated.
+  lastFillAt = Date.now();
   const tab = await getActiveTab();
   if (!tab || !tab.id) return;
 
@@ -1412,6 +1876,10 @@ async function handleFill() {
         matchedPath: r.matchedPath,
         tagName: r.tagName,
         inputType: r.inputType,
+        // Forwarded so the filler can tell a consent checkbox from a plain
+        // assertion, and report the first as a deliberate choice rather than a
+        // failure. Set by matcher.js; it is always false on every other row.
+        consent: r.consent === true,
         // Multi-select groups tick one box per entry in values[], so the filler
         // knows it may select several rather than stopping at the first match.
         ...(r.multiple ? { multiple: true, values: r.values || [] } : {})
@@ -1442,6 +1910,29 @@ async function handleFill() {
     let textTotal = 0;
     let fileOk = 0;
     let failures = [];
+
+    // Everything still outstanding once this pass is over, keyed by the frame it
+    // lives in, so each frame can be told to mark its own. Seeded from the rows
+    // that were never fillable and added to as failures come back, because both
+    // are things the user has to find on the page.
+    const outstanding = new Map();
+
+    // Replaced rather than pushed to: a second Fill on the same step must not
+    // inherit the first pass's failures, or a field the user fixed by hand would
+    // keep blocking Next.
+    lastFillFailures = [];
+
+    const noteOutstanding = (frameId, uid) => {
+      if (!uid) return;
+      if (!outstanding.has(frameId)) outstanding.set(frameId, new Set());
+      outstanding.get(frameId).add(uid);
+    };
+
+    for (const row of currentRows) {
+      if (!rowNeedsHands(row)) continue;
+      const { frameId, uid } = splitFrameUid(row.uid);
+      noteOutstanding(frameId, uid);
+    }
 
     if (textPayload.length) {
       // One call per frame, because that is the only way to address the frame a
@@ -1486,6 +1977,25 @@ async function handleFill() {
               return `${label}: ${r.reason}`;
             })
         );
+
+        // A field that refused to take is the most important thing to point at:
+        // the report says a value was applied, but on this field it was not, so
+        // the user has to know before continuing rather than after.
+        for (const r of results) {
+          if (!r.ok) {
+            noteOutstanding(frameId, r.uid);
+            const payload = items.find((p) => p.uid === r.uid) || {};
+            lastFillFailures.push({
+              uid: r.uid,
+              label: payload.label || r.uid,
+              reason: r.reason || "",
+              // Carried from the row so a consent checkbox stays distinguishable
+              // from a real failure. Next ignores consent items rather than
+              // refusing forever over a box the user is meant to tick.
+              consent: payload.consent === true
+            });
+          }
+        }
       }
     }
 
@@ -1508,12 +2018,57 @@ async function handleFill() {
         // Say so, and say what to do instead.
         failures.push(`${row.label || row.uid}: ${result.reason}`);
       }
+
+      // Only on the way to success — a refused attachment has no control to
+      // point at, since the input may not even be on the page.
+      if (!result || !result.ok) noteOutstanding(frameId, uid);
+    }
+
+
+    // ================================================================
+    // MARK WHAT IS LEFT, ON THE PAGE
+    // ================================================================
+    //
+    // The status line can report that two fields did not take, but the user
+    // still has to find them: on a long Workday step that means scrolling past a
+    // screen of correct values to spot the two that are not.
+    //
+    // So the page marks its own outstanding fields. This runs after every fill
+    // and upload rather than inside them, so a field a later write succeeded on
+    // is not left marked. Clearing is part of the same call, which is what keeps
+    // a second Fill on the same step from stacking marks on fields the first
+    // pass already fixed.
+    //
+    let marked = 0;
+
+    for (const [frameId, uidSet] of outstanding) {
+      try {
+        const result = await injectIntoFrame(tab.id, frameId, highlightReviewFields, [
+          {
+            uids: Array.from(uidSet),
+            // Scroll only the top document. Scrolling from inside a nested frame
+            // moves that frame's own content, which on most of these forms is an
+            // invisible sliver — it would look like the page just did nothing.
+            scroll: frameId === 0
+          }
+        ]);
+        marked += (result && result.marked) || 0;
+      } catch {
+        // A frame can be torn down between the fill and the highlight (a step
+        // that replaced itself). Losing the marks there costs nothing — the
+        // failure lines and the row list still name every field.
+      }
     }
 
     const parts = [];
     if (textTotal) parts.push(`filled ${textOk}/${textTotal} fields`);
     if (filePayload.length) parts.push(`attached ${fileOk}/${filePayload.length} resume upload(s)`);
-    status.textContent = `${parts.join(", ")}. Review the page before submitting.`;
+
+    const outstandingNote = marked
+      ? ` ${marked} highlighted on the page need${marked === 1 ? "s" : ""} you.`
+      : "";
+
+    status.textContent = `${parts.join(", ")}.${outstandingNote} Review the page before submitting.`;
 
     if (failures.length) {
       // One line per field that didn't take, so a failure can be acted on
@@ -1538,8 +2093,18 @@ async function handleFill() {
       // proxy this extension has for match quality.
       auto_included: included.filter((r) => r.status === "auto").length,
       review_included: included.filter((r) => r.status === "review").length,
-      edited_drafts_included: included.filter((r) => r.draftSource).length
+      edited_drafts_included: included.filter((r) => r.draftSource).length,
+      // How much of the page was still the user's to do when the pass ended, and
+      // how much of that the extension pointed at. Counts only.
+      outstanding_rows: currentRows.filter(rowNeedsHands).length,
+      outstanding_marked: marked
     });
+
+    // The Next button's enabled state is derived from whether this pass left
+    // anything broken, so it has to be recomputed here rather than only on scan.
+    // The user fixes fields by hand in the page all the time, and without this
+    // the button would stay grey after they have fixed them.
+    await syncNextButton();
   } catch (err) {
     status.textContent = `Fill failed: ${err.message}`;
     Analytics.trackTimed("Fill Failed", startedAt, { ats: currentAts, error: err.message });
@@ -1598,11 +2163,69 @@ async function init() {
   document.getElementById("no-profile").classList.add("hidden");
   document.getElementById("main").classList.remove("hidden");
   renderProfileSummary(currentProfile);
+
+  // The review list appears on open without a Scan click, through the same
+  // debounced path as every other automatic trigger — a content-script report
+  // arriving at the same moment coalesces into this one scan.
+  scheduleAutoScan("auto:panel-open");
 }
 
-document.getElementById("scan-btn").addEventListener("click", handleScan);
+document.getElementById("scan-btn").addEventListener("click", () => handleScan("manual"));
 document.getElementById("resolve-btn").addEventListener("click", (event) => handleResolveAll(event.currentTarget));
 document.getElementById("fill-btn").addEventListener("click", handleFill);
+document.getElementById("next-btn").addEventListener("click", (event) => handleNext(event.currentTarget));
+
+// ---- automatic scanning wiring ----
+//
+// Three triggers refresh the review list: the content script's report (the
+// page's form changed or appeared), a tab switch (the rows on screen belong
+// to the tab that was last scanned), and a navigation (a fresh document whose
+// form may be anything, including nothing — the old rows must clear).
+// Scan is still the only thing that happens by itself; fill and resolve are
+// one click each, above.
+//
+// Row edits are watched so an automatic rescan cannot throw away what the
+// user typed into the review list; see markRowsDirty()/rowsDirty.
+const fieldList = document.getElementById("field-list");
+fieldList.addEventListener("input", markRowsDirty);
+fieldList.addEventListener("change", markRowsDirty);
+
+// The content script reports from every frame of every http(s) page. Only the
+// tab the panel is showing matters: reports from other tabs are that tab's
+// business and are picked up when it is activated.
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (!message || message.type !== "autofill:form-detected") return;
+  if (!sender.tab || sender.tab.id == null) return;
+  const reportedTabId = sender.tab.id;
+  getActiveTab().then((active) => {
+    if (!active || active.id !== reportedTabId) return;
+    scheduleAutoScan("auto:form-detected");
+  });
+});
+
+// A tab switch invalidates the rows on screen: they describe the tab that was
+// active when they were scanned. Activation in another window does not (the
+// active tab of THIS window is what the panel shows, and it did not move), so
+// the activated tab is checked against the panel's own active tab.
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  getActiveTab().then((active) => {
+    if (!active || active.id !== tabId) return;
+    rowsDirty = false;
+    scheduleAutoScan("auto:tab-switch");
+  });
+});
+
+// A completed navigation lands on a new document. Its content script reports
+// too, but a page with nothing to scan reports nothing at all, and the
+// previous document's rows must still be replaced by "0 fields".
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== "complete") return;
+  getActiveTab().then((active) => {
+    if (!active || active.id !== tabId) return;
+    rowsDirty = false;
+    scheduleAutoScan("auto:navigation");
+  });
+});
 document.getElementById("access-btn").addEventListener("click", () => {
   document.getElementById("scan-status").textContent =
     "Site access is controlled in Chrome: open chrome://extensions, find this extension, and set Site access to 'On all sites'.";

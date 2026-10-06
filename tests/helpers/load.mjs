@@ -214,6 +214,7 @@ const LIB_DEPS = {
   "draft.js": ["schema.js", "matcher.js"],
   "resume-tailor.js": ["schema.js", "providers.js"],
   "mail-import.js": ["schema.js", "providers.js", "tracker.js"],
+  "discover.js": ["schema.js", "providers.js", "tracker.js", "mail-import.js", "resume-tailor.js", "page-scripts.js"],
   "registry.js": [
     "generic.js",
     "workday.js",

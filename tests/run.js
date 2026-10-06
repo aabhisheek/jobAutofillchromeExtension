@@ -37,9 +37,13 @@ for (const file of files) {
   const counts = [...out.matchAll(/(\d+) passed, (\d+) failed/g)].pop();
   if (counts) {
     totals.push({ file, pass: +counts[1], fail: +counts[2], ok });
-  } else if (!ok) {
+  } else {
+    // No tally at all means the harness died before finishing. Record it as a
+    // failure with its exit code rather than letting it silently drop out of
+    // the summary, which reads exactly like "it passed".
+    const crashed = { file, pass: 0, fail: 0, ok: false, note: `CRASHED (exit ${res.status})` };
+    totals.push(crashed);
     failed += 1;
-    console.log(`${file}: CRASHED (exit ${res.status})`);
   }
 }
 
@@ -49,9 +53,12 @@ let bad = 0;
 for (const t of totals) {
   pass += t.pass;
   bad += t.fail;
-  console.log(`  ${t.ok ? "PASS" : "FAIL"}  ${t.file.padEnd(24)} ${t.pass} passed, ${t.fail} failed`);
+  const detail = t.note || `${t.pass} passed, ${t.fail} failed`;
+  console.log(`  ${t.ok ? "PASS" : "FAIL"}  ${t.file.padEnd(24)} ${detail}`);
 }
 console.log(`${"=".repeat(60)}`);
 console.log(`  ${pass} assertions passed, ${bad} failed`);
+
+if (failed) console.log(`  ${failed} harness(es) crashed before reporting`);
 
 process.exit(bad > 0 || failed > 0 ? 1 : 0);
