@@ -28,6 +28,11 @@ let editEpoch = 0;
 // them. That also keeps the board's own wiring above this one readable.
 const mail = {};
 
+// The controller for the sync currently running in this tab, so the Stop
+// button can cancel it. Null when nothing is running — which is also what the
+// Stop handler checks before doing anything.
+let mailSyncController = null;
+
 // Job-discovery panel state, the same shape as `mail` — looked up lazily, one
 // flag so a storage-driven repaint never fights a run in progress.
 const discover = { running: false, settings: null };
@@ -37,7 +42,7 @@ const discover = { running: false, settings: null };
 // reloaded, so without a visible stamp there is no way to tell whether a panel
 // is showing current code or a cached copy from before a fix. If this does not
 // read `DASHBOARD_BUILD` below, hard-reload the tab.
-const DASHBOARD_BUILD = "discover-2026-10-06a";
+const DASHBOARD_BUILD = "mail-ai-only-2026-10-16a";
 
 function byId(id) {
   return document.getElementById(id);
@@ -357,6 +362,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
   // The background worker writes its own summary, and a sync started from the
   // alarm lands here with no UI open at all.
   if (changes.emailSyncState && !mail.syncing) renderLastRun();
+  // The schedule's own keys, written by the worker when it arms an alarm. A
+  // next-run line and the history repaint from these even though the last-run
+  // line above did not change.
+  if ((changes.schedulerStatus || changes.emailSyncHistory) && !mail.syncing) renderMailSchedule();
+  // Naukri: the alarm's run writes all three of these from the worker, so the
+  // panel stays live without a reload.
+  if (changes.naukriRefreshState || changes.naukriRefreshHistory || changes.schedulerStatus) renderNaukriStatus();
   // The discovery engine writes its own last-run summary too — from this page
   // normally, but the same rule applies: never repaint over a live run.
   if (changes.discoverState && !discover.running) renderDiscoverLastRun();
@@ -402,50 +414,44 @@ function mailStatus(text, kind = "") {
   el.className = `status-msg ${kind}`.trim();
 }
 
-function setupStatus(text, kind = "") {
-  const el = byId("mail-setup-msg");
-  if (!el) return;
-  el.textContent = text;
-  el.className = `status-msg ${kind}`.trim();
+// The look-back is a free-text count now, so the value has to survive a blank
+// box, a stray letter, a fraction and the absurd. One day is the floor (Gmail's
+// newer_than needs an integer) and ten years is the ceiling, which is past any
+// real inbox history and keeps a mistyped "99999999" from asking Gmail for the
+// whole account.
+const LOOKBACK_MIN_DAYS = 1;
+const LOOKBACK_MAX_DAYS = 3650;
+
+function clampLookbackDays(value) {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n < LOOKBACK_MIN_DAYS) return 30;
+  return Math.min(n, LOOKBACK_MAX_DAYS);
 }
 
-// Copy buttons for the two values that have to be pasted into Google Cloud
-// character for character. Google compares redirect URIs as exact strings, so a
-// transcribed one is a `redirect_uri_mismatch` with no other visible cause --
-// worth removing transcription from the loop entirely.
-function initCopyButtons() {
-  document.querySelectorAll("[data-copy]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const source = byId(String(button.dataset.copy || "").replace(/^#/, ""));
-      const value = String((source && source.textContent) || "").trim();
-      if (!value) {
-        setupStatus("Nothing to copy yet.", "err");
-        return;
-      }
+// The dedicated AI tally for the mail sync. It is its own row rather than part
+// of the transient status line because the counts are the thing the user wants
+// to watch tick by, and they must stay put after the run ends. `stats` is
+// either a live progress tick or a persisted report — both carry
+// aiOn / aiEnriched / aiSkipped / aiFailed / deferred.
+function renderAiStats(stats) {
+  const el = byId("mail-ai-stats");
+  if (!el) return;
 
-      const label = button.textContent;
-      try {
-        await navigator.clipboard.writeText(value);
-        button.textContent = "Copied";
-      } catch {
-        // Clipboard access is denied in some extension contexts, and the older
-        // path still works there.
-        const scratch = document.createElement("textarea");
-        scratch.value = value;
-        scratch.setAttribute("readonly", "");
-        scratch.style.position = "fixed";
-        scratch.style.opacity = "0";
-        document.body.appendChild(scratch);
-        scratch.select();
-        const copied = document.execCommand("copy");
-        scratch.remove();
-        button.textContent = copied ? "Copied" : "Press Ctrl+C";
-      }
-      setTimeout(() => {
-        button.textContent = label;
-      }, 1600);
-    });
-  });
+  const deferred = (stats && stats.deferred) || 0;
+  const on = !!(stats && (stats.aiOn || stats.aiEnriched || stats.aiSkipped || stats.aiFailed || deferred));
+  if (!on) {
+    el.textContent = "";
+    el.className = "ai-stats hidden";
+    return;
+  }
+
+  const enriched = stats.aiEnriched || 0;
+  const skipped = stats.aiSkipped || 0;
+  const failed = stats.aiFailed || 0;
+  let text = `AI: ${enriched} enriched · ${skipped} skipped · ${failed} failed`;
+  if (deferred) text += ` · ${deferred} waiting for AI`;
+  el.textContent = text;
+  el.className = `ai-stats${failed || deferred ? " warn" : ""}`;
 }
 
 function renderLastRun() {
@@ -456,6 +462,9 @@ function renderLastRun() {
     // Cleared first, on every path. A reason left over from the previous run
     // would describe a sync that no longer exists.
     renderSyncFailures([]);
+    // The persisted AI tally, so the counts survive a page reload even when
+    // this run's progress ticks happened minutes ago.
+    renderAiStats(state);
 
     if (!state || !state.at) {
       el.textContent = "Never synced yet.";
@@ -473,11 +482,23 @@ function renderLastRun() {
     if (state.updated) bits.push(`${state.updated} moved stage`);
     if (state.datesFixed) bits.push(`${state.datesFixed} dates corrected`);
     if (state.skipped) bits.push(`${state.skipped} already imported`);
+    if (state.ignored) bits.push(`${state.ignored} not job-related`);
     if (state.failed) bits.push(`${state.failed} unreadable`);
-    bits.push(`${state.scanned} matching emails`);
+    bits.push(state.full ? `${state.scanned} emails read` : `${state.scanned} matching emails`);
     if (state.aiEnriched) bits.push(`${state.aiEnriched} read by AI`);
-    if (state.aiSkipped) bits.push(`${state.aiSkipped} read locally (over the AI limit)`);
-    if (state.aiFailed) bits.push(`${state.aiFailed} AI call(s) failed, read locally`);
+    // In AI-only mode a skipped or failed email is not imported at all, so the
+    // wording must not promise a local fallback that did not happen.
+    if (state.aiSkipped) {
+      bits.push(state.aiRequired
+        ? `${state.aiSkipped} over the AI limit`
+        : `${state.aiSkipped} read locally (over the AI limit)`);
+    }
+    if (state.aiFailed) {
+      bits.push(state.aiRequired
+        ? `${state.aiFailed} AI call(s) failed`
+        : `${state.aiFailed} AI call(s) failed, read locally`);
+    }
+    if (state.deferred) bits.push(`${state.deferred} waiting for AI — will retry`);
 
     el.textContent = `${bits.join(" · ")}.`;
 
@@ -523,15 +544,54 @@ function renderSyncFailures(reasons) {
   box.classList.remove("hidden");
 }
 
+// One bounded run-history list, shared by the mail and Naukri panels. The
+// <details> wrapper is hidden entirely when there is nothing to list, rather
+// than showing an empty "Recent runs" row that promises history and gives
+// none.
+function renderHistory(ulId, boxId, entries, describe) {
+  const ul = byId(ulId);
+  const box = byId(boxId);
+  if (!ul || !box) return;
+
+  ul.textContent = "";
+  const list = Array.isArray(entries) ? entries : [];
+  if (!list.length) {
+    box.classList.add("hidden");
+    return;
+  }
+
+  for (const entry of list) {
+    const li = document.createElement("li");
+    li.textContent = describe(entry);
+    ul.appendChild(li);
+  }
+  box.classList.remove("hidden");
+}
+
+// The mail schedule's "next check" line and its run history. Separate from
+// renderLastRun because they read different keys: the last run is
+// emailSyncState, the schedule and the history are the scheduler's own keys,
+// and a settings/schedule change must repaint this without touching the last
+// run's summary.
+async function renderMailSchedule() {
+  const nextEl = byId("mail-next-run");
+  if (nextEl) {
+    const status = await SchedulerState.readSchedulerStatus();
+    const nextAt = status.emailSync && status.emailSync.nextAt;
+    nextEl.textContent = nextAt
+      ? `Next automatic check ${SchedulerState.formatNextRun(nextAt)} (${new Date(nextAt).toLocaleString()}).`
+      : "Automatic check is off — press Read & Sync to run one now.";
+  }
+
+  const history = await SchedulerState.readEmailHistory();
+  renderHistory("mail-history", "mail-history-box", history, SchedulerState.describeEmailRun);
+}
+
 function renderConnection(connection) {
   const stateEl = byId("mail-conn-state");
   const connectBtn = byId("mail-connect");
   const disconnectBtn = byId("mail-disconnect");
   const noteEl = byId("mail-conn-note");
-  const setupEl = byId("mail-setup");
-
-  // The Google Cloud steps only matter until there is something to paste.
-  if (setupEl) setupEl.classList.toggle("hidden", !!mail.clientId);
 
   if (!stateEl) return;
 
@@ -546,16 +606,9 @@ function renderConnection(connection) {
 
   stateEl.textContent = "Not connected";
   stateEl.className = "pill";
-  if (connectBtn) {
-    connectBtn.classList.remove("hidden");
-    // Nothing to connect until there is a client id, and the button saying
-    // "Connect Gmail" before the user can possibly do so is a dead end.
-    connectBtn.disabled = !mail.clientId;
-  }
+  if (connectBtn) connectBtn.classList.remove("hidden");
   if (disconnectBtn) disconnectBtn.classList.add("hidden");
-  if (noteEl) noteEl.textContent = mail.clientId
-    ? "Grants read-only access so confirmation emails can be read. You can revoke it from your Google account at any time."
-    : "Save a Google OAuth client id above first.";
+  if (noteEl) noteEl.textContent = "Grants read-only access so confirmation emails can be read. You can revoke it from your Google account at any time.";
 }
 
 async function refreshConnection() {
@@ -573,36 +626,86 @@ async function refreshConnection() {
 // force: true means "run whether or not the automatic schedule is switched
 // on", which is right for anything the user just asked for with a click or a
 // page load. Only the background alarm respects the schedule toggle.
-async function runMailSync({ force = true, auto = false } = {}) {
-  if (mail.syncing) return null;
+async function runMailSync({ force = true, auto = false, full = false } = {}) {
+  if (mail.syncing || mail.rechecking) return null;
 
   const button = byId("mail-sync-now");
+  const stopButton = byId("mail-sync-stop");
+  const recheckButton = byId("mail-recheck");
   mail.syncing = true;
+  // One controller per run. Its signal is what Stop trips; the run reads it
+  // between messages and between Gmail pages, so a stop lands within an
+  // in-flight request rather than after the whole window has been read.
+  mailSyncController = new AbortController();
   if (button) button.disabled = true;
+  // The re-check reads the same Gmail quota and writes the same board, so the
+  // two must never run at once.
+  if (recheckButton) recheckButton.disabled = true;
+  if (stopButton) {
+    stopButton.hidden = false;
+    stopButton.disabled = false;
+  }
 
   try {
-    mailStatus(auto ? "Checking your mail…" : "Reading your mail…", "busy");
+    mailStatus(auto ? "Checking your mail…" : full ? "Reading every mail in the window…" : "Reading your mail…", "busy");
+    // Fresh tally for this run; the first progress tick fills it in.
+    renderAiStats(null);
     const report = await MailImport.runSync({
       settings: await loadPanelSettings(),
       force,
-      onProgress: ({ phase, done, total }) => {
-        if (!total) return;
-        mailStatus(phase === "fetch" ? `Reading emails… ${done}/${total}` : `Reading applications… ${done}/${total}`, "busy");
+      full,
+      signal: mailSyncController.signal,
+      onProgress: ({ phase, done, total, aiOn, aiEnriched = 0, aiSkipped = 0, aiFailed = 0, deferred = 0 }) => {
+        const counts = total ? ` ${done}/${total}` : "";
+        const label =
+          phase === "enrich"
+            ? `Using AI…${counts}`
+            : phase === "fetch"
+              ? `Reading emails…${counts}`
+              : phase === "parse"
+                ? `Reading applications…${counts}`
+                : "";
+        if (!label) return;
+        // The AI tallies ride along on every tick from enrichment onwards, so
+        // "how much was read by AI / skipped / failed" stays visible while the
+        // run is still going instead of only appearing in the final report.
+        const ai = aiOn
+          ? ` · AI: ${aiEnriched} enriched, ${aiSkipped} skipped, ${aiFailed} failed${deferred ? `, ${deferred} waiting` : ""}`
+          : "";
+        mailStatus(`${label}${ai}`, "busy");
+        // Same counters in their own always-visible row, so they are readable
+        // during the run and don't scroll past with the status text.
+        renderAiStats({ aiOn, aiEnriched, aiSkipped, aiFailed, deferred });
       }
     });
 
-    if (!report.ok) {
+    if (report && report.aborted) {
+      const kept = report.added + report.updated;
+      mailStatus(
+        kept
+          ? `Stopped — ${kept} application${kept === 1 ? "" : "s"} from the emails already read ${kept === 1 ? "was" : "were"} kept.`
+          : "Stopped. Nothing had been imported yet.",
+        "warn"
+      );
+    } else if (!report.ok) {
       mailStatus(report.notes[0] || "The sync did not finish.", "err");
     } else if (!report.scanned) {
-      mailStatus("No matching emails found. Try a broader Gmail search above.", "warn");
+      mailStatus(full ? "No mail found in this window." : "No matching emails found. Try a broader Gmail search above.", "warn");
     } else {
       const parts = [];
       if (report.added) parts.push(`${report.added} added`);
       if (report.updated) parts.push(`${report.updated} moved stage`);
       if (report.datesFixed) parts.push(`${report.datesFixed} dates corrected`);
       if (report.skipped) parts.push(`${report.skipped} already imported`);
+      if (report.ignored) parts.push(`${report.ignored} not job-related`);
+      if (report.aiRejected) parts.push(`${report.aiRejected} rejected by AI`);
       if (report.failed) parts.push(`${report.failed} unreadable`);
-      mailStatus(parts.length ? `${parts.join(", ")}.` : "Nothing new to import.", "ok");
+      if (report.aiEnriched) parts.push(`${report.aiEnriched} enriched by AI`);
+      if (report.aiSkipped) parts.push(`${report.aiSkipped} over the AI limit`);
+      if (report.aiFailed) parts.push(`${report.aiFailed} AI failed`);
+      if (report.deferred) parts.push(`${report.deferred} waiting for AI — will retry next sync`);
+      const summary = parts.length ? `${parts.join(", ")}.` : "Nothing new to import.";
+      mailStatus(report.notes.length ? `${summary} ${report.notes[0]}` : summary, "ok");
     }
 
     renderLastRun();
@@ -613,8 +716,173 @@ async function runMailSync({ force = true, auto = false } = {}) {
     return null;
   } finally {
     mail.syncing = false;
+    mailSyncController = null;
     if (button) button.disabled = false;
+    if (recheckButton) recheckButton.disabled = false;
+    if (stopButton) {
+      stopButton.hidden = true;
+      stopButton.disabled = false;
+    }
   }
+}
+
+// The line under the mail panel summarising the last AI re-check. Reads the
+// persisted report so it survives a reload the same way the sync's last-run
+// line does; an explicit report passed in (straight after a run) skips the read.
+async function renderRecheckLastRun(report) {
+  const el = byId("mail-recheck-last");
+  if (!el) return;
+
+  const state = report || (await MailImport.readReclassifyState());
+  if (!state || !state.at) {
+    el.textContent = "";
+    return;
+  }
+
+  const when = new Date(state.at).toLocaleString();
+  if (!state.ok) {
+    el.textContent = `Last re-check ${when} — ${(state.notes && state.notes[0]) || "it did not finish."}`;
+    return;
+  }
+
+  const bits = [`Last re-checked ${when}`];
+  if (state.moved) bits.push(`${state.moved} moved`);
+  if (state.renamed) bits.push(`${state.renamed} renamed`);
+  if (state.unchanged) bits.push(`${state.unchanged} already right`);
+  const windowDays = Number(state.lookbackDays) || 0;
+  if (state.unmatched) {
+    bits.push(
+      windowDays
+        ? `${state.unmatched} not checked (no email within ${windowDays} days — raise Look back)`
+        : `${state.unmatched} not checked (no matching email in the window)`
+    );
+  }
+  bits.push(`${state.matched} of ${state.rechecked} matched`);
+  el.textContent = `${bits.join(" · ")}.`;
+}
+
+// The AI re-check: read the window again, ask AI for the stage behind every
+// imported card, and move each one to whatever the AI decides — including
+// backwards, which a normal sync deliberately never does. One place, like
+// runMailSync, so the button and its status line cannot drift apart.
+async function runMailReclassify() {
+  if (mail.rechecking || mail.syncing) return null;
+
+  const button = byId("mail-recheck");
+  const syncButton = byId("mail-sync-now");
+  mail.rechecking = true;
+  if (button) button.disabled = true;
+  if (syncButton) syncButton.disabled = true;
+
+  try {
+    mailStatus("Re-reading your applications with AI…", "busy");
+    // Fresh tally for this run; the enrichment ticks fill it in.
+    renderAiStats(null);
+
+    const settings = await loadPanelSettings();
+    const windowDays = clampLookbackDays(settings.emailLookbackDays);
+    const report = await MailImport.reclassifyWithAi({
+      settings,
+      onProgress: ({ phase, done, total, aiEnriched = 0, aiFailed = 0 }) => {
+        const label =
+          phase === "fetch"
+            ? "Reading emails"
+            : phase === "enrich"
+              ? "Asking AI"
+              : phase === "apply"
+                ? "Moving cards"
+                : "";
+        if (!label) return;
+        mailStatus(`${label}…${total ? ` ${done}/${total}` : ""}`, "busy");
+        if (phase === "enrich") renderAiStats({ aiOn: true, aiEnriched, aiFailed });
+      }
+    });
+
+    await renderRecheckLastRun(report);
+    // Persist the final AI tally on the stats row, not just the live ticks, so
+    // the counts stay put after the run ends.
+    if (report && report.ok) renderAiStats(report);
+
+    if (!report || !report.ok) {
+      mailStatus((report && report.notes[0]) || "The re-check did not finish.", "err");
+    } else if (!report.rechecked) {
+      mailStatus("Nothing to re-check — no cards have been imported from Gmail yet.", "warn");
+    } else if (report.aiFailed && !report.aiEnriched) {
+      // Every call failed, so nothing could be matched. Saying "no emails
+      // matched" here would send the user chasing the look-back window when the
+      // real problem is the provider, so the failure is named outright.
+      const reason = (report.notes || []).find((note) => /^AI provider failed:/.test(note));
+      mailStatus(
+        `AI could not read your email — all ${report.aiFailed} call${report.aiFailed === 1 ? "" : "s"} failed. ${reason ? reason.replace(/^AI provider failed:\s*/, "") : "Check your API key on the API Keys page and try again."}`,
+        "err"
+      );
+    } else if (!report.matched) {
+      mailStatus(
+        `None of your ${report.rechecked} imported card${report.rechecked === 1 ? "" : "s"} had an email in the last ${windowDays} day${windowDays === 1 ? "" : "s"}, so nothing could be checked. Raise Look back above and run it again.`,
+        "warn"
+      );
+    } else {
+      const bits = [];
+      if (report.moved) bits.push(`${report.moved} moved`);
+      if (report.renamed) bits.push(`${report.renamed} renamed`);
+      if (report.unchanged) bits.push(`${report.unchanged} already right`);
+      if (report.unmatched) {
+        bits.push(
+          `${report.unmatched} not checked (their emails are older than the ${windowDays}-day look-back — raise Look back and re-run)`
+        );
+      }
+      if (report.aiFailed) bits.push(`${report.aiFailed} AI call${report.aiFailed === 1 ? "" : "s"} failed`);
+      mailStatus(
+        `Re-checked ${report.matched} of ${report.rechecked} card${report.rechecked === 1 ? "" : "s"} — ${bits.length ? bits.join(", ") : "nothing changed"}.`,
+        "ok"
+      );
+    }
+
+    await refresh();
+    return report;
+  } catch (err) {
+    mailStatus(err.message, "err");
+    return null;
+  } finally {
+    mail.rechecking = false;
+    if (button) button.disabled = false;
+    if (syncButton) syncButton.disabled = false;
+  }
+}
+
+// The "start over" path: wipe the board and the imported-email ledger, then read
+// the whole look-back window again so every tab is rebuilt from the mail itself.
+//
+// Clearing the ledger is what makes this a rebuild rather than a re-check: with
+// it intact, runSync treats every mail as already imported and only repairs
+// dates, so the board would stay empty. Emptying both is the only way to get a
+// genuinely fresh board out of the same inbox. The day count currently in the
+// box is saved first, so the rebuild reads the window the user is looking at
+// even if they never pressed Save settings.
+async function rebuildFromMail() {
+  if (mail.syncing || mail.rechecking) return null;
+
+  const lookback = byId("mail-lookback");
+  const days = clampLookbackDays(lookback && lookback.value);
+  const count = (await Tracker.list()).length;
+
+  const ok = confirm(
+    `Delete all ${count} card${count === 1 ? "" : "s"} on the board and forget every imported email, then read the last ${days} day${days === 1 ? "" : "s"} of mail again?\n\n` +
+      "• Every Saved / Applied / Interview / Offer / Rejected card is removed — including any you added by hand.\n" +
+      "• The last " + days + " day" + (days === 1 ? "" : "s") + " of email is read again and the tabs are rebuilt from it, with AI if it is switched on.\n" +
+      "• This cannot be undone."
+  );
+  if (!ok) return null;
+
+  await savePanelSettings({ emailLookbackDays: days });
+  mail.settings = await loadPanelSettings();
+
+  await Tracker.clear();
+  await MailImport.ledger.clear();
+  await refresh();
+  mailStatus(`Cleared. Reading the last ${days} day${days === 1 ? "" : "s"} of mail to rebuild your tabs…`, "busy");
+
+  return runMailSync({ force: true, full: true });
 }
 
 async function initMailPanel() {
@@ -627,37 +895,6 @@ async function initMailPanel() {
   if (buildEl) buildEl.textContent = DASHBOARD_BUILD;
 
   mail.settings = await loadPanelSettings();
-  mail.clientId = String(mail.settings.gmailClientId || "").trim();
-
-  const clientIdInput = byId("mail-client-id");
-  if (clientIdInput) clientIdInput.value = mail.clientId;
-
-  // The secret is deliberately never written back into the input: a blank field
-  // means "keep what is stored", which is what makes it safe to screenshot the
-  // dashboard and what lets the placeholder report whether one exists at all.
-  const secretInput = byId("mail-client-secret");
-  if (secretInput) {
-    secretInput.value = "";
-    secretInput.placeholder = mail.settings.gmailClientSecret
-      ? "Saved — type to replace"
-      : "GOCSPX-…";
-  }
-  const clearSecret = byId("mail-clear-secret");
-  if (clearSecret) clearSecret.checked = false;
-
-  // Show the extension id and the exact redirect URI this build will send, so
-  // they can be compared against the Application ID registered in Google Cloud.
-  // This mismatch is the only cause of `redirect_uri_mismatch`, and it is
-  // otherwise completely invisible from inside the extension.
-  const extIdEl = byId("mail-ext-id");
-  if (extIdEl) extIdEl.textContent = chrome.runtime.id || "(unavailable)";
-
-  const redirectEl = byId("mail-redirect-uri");
-  if (redirectEl && chrome.identity && chrome.identity.getRedirectURL) {
-    redirectEl.textContent = chrome.identity.getRedirectURL();
-  }
-
-  initCopyButtons();
 
   const enabled = byId("mail-enabled");
   const every = byId("mail-every");
@@ -665,11 +902,15 @@ async function initMailPanel() {
   const lookback = byId("mail-lookback");
   const query = byId("mail-query");
   const useAi = byId("mail-use-ai");
+  const requireAi = byId("mail-require-ai");
 
   if (enabled) enabled.checked = !!mail.settings.emailSyncEnabled;
   if (time) time.value = mail.settings.emailSyncTime || "09:00";
   if (query) query.value = mail.settings.emailSyncQuery || "";
   if (useAi) useAi.checked = mail.settings.emailUseAi !== false;
+  // Defaults on: the whole point is that an unread card never reaches the board.
+  // Only an explicit false turns it off.
+  if (requireAi) requireAi.checked = mail.settings.emailRequireAi !== false;
 
   // The daily time only means something on the daily schedule; on the hourly
   // ones it still anchors the first run, but showing it would invite the user
@@ -689,14 +930,11 @@ async function initMailPanel() {
   }
   renderTimeRow();
 
-  const days = String(mail.settings.emailLookbackDays || 30);
-  // Fall back to the closest option rather than leaving the select blank: a
-  // stored value of 45 is a real state and silently showing "30 days" would
-  // hide it.
-  if (lookback) {
-    if ([...lookback.options].some((option) => option.value === days)) lookback.value = days;
-    else lookback.selectedIndex = 1;
-  }
+  // A free day count rather than a fixed menu: how far back a card's email can
+  // be depends on how long the user has been applying, and a rejection from four
+  // months ago is a real thing to re-read. Any positive whole number is
+  // accepted; only a missing or nonsensical stored value falls back to 30.
+  if (lookback) lookback.value = String(clampLookbackDays(mail.settings.emailLookbackDays));
 
   const aiConfigured = configuredProviders(mail.settings).length > 0;
   if (useAi && !aiConfigured) {
@@ -708,54 +946,18 @@ async function initMailPanel() {
 
   const connection = await refreshConnection();
   renderLastRun();
-
-  byId("mail-save-client").addEventListener("click", async () => {
-    const value = (byId("mail-client-id").value || "").trim();
-    if (value && !/\.apps\.googleusercontent\.com$/.test(value)) {
-      setupStatus("That does not look like a Google client id — it should end in apps.googleusercontent.com.", "err");
-      return;
-    }
-    await savePanelSettings({ gmailClientId: value });
-
-    // Three outcomes, and conflating them is how a secret silently disappears:
-    // a typed value replaces, an empty field keeps, the checkbox clears.
-    const secretInput = byId("mail-client-secret");
-    const clearInput = byId("mail-clear-secret");
-    const typed = String((secretInput && secretInput.value) || "").trim();
-    const shouldClear = !!(clearInput && clearInput.checked);
-    let secretNote = "";
-    if (shouldClear) {
-      await savePanelSettings({ gmailClientSecret: "" });
-      secretNote = " Client secret cleared.";
-    } else if (typed) {
-      if (!/^[A-Za-z0-9_-]{10,}$/.test(typed)) {
-        setupStatus("That does not look like a Google client secret — it should be GOCSPX-…", "err");
-        return;
-      }
-      await savePanelSettings({ gmailClientSecret: typed });
-      secretNote = " Client secret saved.";
-      if (secretInput) secretInput.value = "";
-    }
-
-    mail.clientId = value;
-    mail.settings = await loadPanelSettings();
-    setupStatus(
-      (value ? "Saved. Now connect your Gmail." : "Client ID cleared.") + secretNote,
-      "ok"
-    );
-    await refreshConnection();
-  });
+  renderMailSchedule();
+  renderRecheckLastRun();
 
   byId("mail-connect").addEventListener("click", async () => {
     mailStatus("Waiting for Google's consent screen…", "busy");
     try {
-      // The settings are re-read rather than reused: saving the client id is a
-      // separate click, and a stale copy here is the difference between a
-      // working connection and a Google error about an unknown client.
+      // Settings are re-read rather than reused so a freshly written
+      // src/data/google-oauth.json is picked up without a page reload.
       const connection = await Gmail.connect({ settings: await loadPanelSettings() });
       renderConnection(connection);
       // The grant is done, so the first import runs itself. Making the user
-      // press Sync now once to see their own history is exactly the extra
+      // press Read & Sync once to see their own history is exactly the extra
       // click this panel should not have.
       await runMailSync({ force: true, auto: true });
     } catch (err) {
@@ -775,9 +977,10 @@ async function initMailPanel() {
       emailSyncEnabled: !!(enabled && enabled.checked),
       emailSyncEvery: syncEvery(),
       emailSyncTime: (time && time.value) || "09:00",
-      emailLookbackDays: Number((lookback && lookback.value) || 30),
+      emailLookbackDays: clampLookbackDays(lookback && lookback.value),
       emailSyncQuery: (query && query.value.trim()) || MailImport.DEFAULT_QUERY,
-      emailUseAi: !!(useAi && useAi.checked)
+      emailUseAi: !!(useAi && useAi.checked),
+      emailRequireAi: !!(requireAi && requireAi.checked)
     };
 
     await savePanelSettings(patch);
@@ -797,19 +1000,56 @@ async function initMailPanel() {
     mailStatus(
       patch.emailSyncEnabled
         ? `Saved. Checking your mail ${rhythm} — next run ${when}.`
-        : "Saved. The automatic check is off; Sync now still works.",
+        : "Saved. The automatic check is off; Read & Sync still works.",
       "ok"
     );
   });
 
-  byId("mail-sync-now").addEventListener("click", () => runMailSync({ force: true }));
+  // The manual click is the full-window read: every mail in the look-back
+  // window re-fetched from Gmail, not the newest page of the search query, so
+  // a new mail the query never matched still reaches the board.
+  byId("mail-sync-now").addEventListener("click", () => runMailSync({ force: true, full: true }));
+
+  // Stop trips the signal of the run in progress. It is only ever visible
+  // while that run is alive, so there is nothing to guard against here beyond
+  // the controller being present; disabling the button makes a second press a
+  // no-op until the run's own finally block resets the pair.
+  const stopButton = byId("mail-sync-stop");
+  if (stopButton) {
+    stopButton.addEventListener("click", () => {
+      if (!mailSyncController) return;
+      mailSyncController.abort();
+      stopButton.disabled = true;
+      mailStatus("Stopping…", "warn");
+    });
+  }
 
   byId("mail-reset").addEventListener("click", async () => {
     if (!confirm("Forget which emails have already been imported? The next sync will read them again — existing cards are updated rather than duplicated, but titles and companies may be re-guessed.")) return;
 
     await MailImport.ledger.clear();
-    mailStatus("Cleared. Press Sync now to read your mail again.", "ok");
+    mailStatus("Cleared. Press Read & Sync to read your mail again.", "ok");
   });
+
+  const rebuildButton = byId("mail-rebuild");
+  if (rebuildButton) rebuildButton.addEventListener("click", () => rebuildFromMail());
+
+  // The AI re-check. The confirmation is not decoration: the pass can move a
+  // card backwards and spends one AI request per batch of emails, so both the
+  // authority it takes over your tabs and the cost are stated before it starts.
+  const recheckButton = byId("mail-recheck");
+  if (recheckButton) {
+    recheckButton.addEventListener("click", () => {
+      if (mail.rechecking || mail.syncing) return;
+      const ok = confirm(
+        "Ask AI to re-read the emails behind every card imported from Gmail and move each one to the stage it decides?\n\n" +
+          "• Cards can move forward or backward (for example Applied → Rejected, or Rejected → Interview).\n" +
+          "• Cards you added by hand are left untouched.\n" +
+          "• Every job email in the look-back window is sent to your AI provider, which may cost money."
+      );
+      if (ok) runMailReclassify();
+    });
+  }
 
   // Opening the dashboard is itself a sync trigger: the board is what the user
   // came to read, and it should already hold this morning's mail rather than
@@ -820,6 +1060,137 @@ async function initMailPanel() {
   if (connection && connection.connected) {
     runMailSync({ force: true, auto: true }).catch(() => {});
   }
+}
+
+// ---- Naukri profile refresh panel ----------------------------------------
+//
+// The run itself belongs to the worker (it owns the daily alarm) and to the
+// content script (it owns the page's DOM). This panel is only the switch, the
+// clock, and a "do it now" button that asks the worker for the same run the
+// alarm would do — with the content script's own report handed back verbatim.
+
+function naukriStatus(text, kind = "") {
+  const el = byId("naukri-status-msg");
+  if (!el) return;
+  el.textContent = text;
+  el.className = `status-msg ${kind}`.trim();
+}
+
+// The Naukri panel's persisted status — the last run (naukriRefreshState), the
+// next scheduled run (schedulerStatus) and the run history. All three are
+// written by the worker, so a refresh that happened while this tab was closed
+// (or the side panel was the only thing open) shows up the moment it is
+// opened, and the storage listener below repaints it live when the alarm
+// fires while the tab is open.
+async function renderNaukriStatus() {
+  const lastEl = byId("naukri-last-run");
+  const nextEl = byId("naukri-next-run");
+
+  const [state, status] = await Promise.all([
+    SchedulerState.readNaukriState(),
+    SchedulerState.readSchedulerStatus()
+  ]);
+
+  if (lastEl) {
+    if (!state || !state.at) {
+      lastEl.textContent = "Not refreshed yet.";
+    } else if (!state.ok) {
+      lastEl.textContent = `Last attempt ${SchedulerState.formatStamp(state.at)} — ${state.reason || "it did not finish."}`;
+    } else {
+      const outcome = state.saved ? "profile saved" : state.edited ? "edited but not saved" : "nothing changed";
+      lastEl.textContent = `Last refreshed ${SchedulerState.formatStamp(state.at)} — ${outcome}.`;
+    }
+  }
+
+  if (nextEl) {
+    const nextAt = status.naukriRefresh && status.naukriRefresh.nextAt;
+    nextEl.textContent = nextAt
+      ? `Next refresh ${SchedulerState.formatNextRun(nextAt)} (${new Date(nextAt).toLocaleString()}).`
+      : "Daily refresh is off.";
+  }
+
+  const history = await SchedulerState.readNaukriHistory();
+  renderHistory("naukri-history", "naukri-history-box", history, SchedulerState.describeNaukriRun);
+}
+
+// The run behind both "do it now" buttons — the panel's own and the page-head
+// one. Kept as one function so the two cannot drift: same message, same
+// verbatim report, same status line. It opens and scrolls to the panel first
+// so the progress line the run writes into is on screen from either trigger.
+async function runNaukriNow() {
+  const panel = byId("naukri-panel");
+  if (panel) {
+    panel.open = true;
+    if (typeof panel.scrollIntoView === "function") {
+      panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }
+
+  const button = byId("naukri-run");
+  if (button) button.disabled = true;
+  naukriStatus("Opening your Naukri profile…", "busy");
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "naukri:run" });
+    if (!result) {
+      naukriStatus("The extension worker did not answer.", "err");
+    } else if (!result.ok) {
+      naukriStatus(result.reason || result.error || "The refresh did not finish.", "err");
+    } else if (result.edited) {
+      const note = result.note ? ` (${result.note})` : "";
+      naukriStatus((result.saved ? "Done — the resume headline was toggled and the profile was saved." : "The resume headline was changed but it could not be saved.") + note, result.saved ? "ok" : "err");
+    }
+  } catch (err) {
+    naukriStatus(err.message, "err");
+  } finally {
+    if (button) button.disabled = false;
+  }
+  // Repaint from storage after the run: the worker recorded the outcome, and
+  // this is the panel's own summary of it (the transient status line above
+  // is only what the click returned).
+  await renderNaukriStatus();
+}
+
+async function initNaukriPanel() {
+  const panel = byId("naukri-panel");
+  if (!panel) return;
+
+  const enabled = byId("naukri-enabled");
+  const time = byId("naukri-time");
+  const settings = await loadPanelSettings();
+
+  if (enabled) enabled.checked = settings.naukriRefreshEnabled !== false;
+  if (time) time.value = settings.naukriRefreshTime || "08:00";
+
+  await renderNaukriStatus();
+
+  byId("naukri-save").addEventListener("click", async () => {
+    const patch = {
+      naukriRefreshEnabled: !!(enabled && enabled.checked),
+      naukriRefreshTime: (time && time.value) || "08:00"
+    };
+    await savePanelSettings(patch);
+
+    // The alarm lives in the worker; this is the nudge that re-arms it with
+    // the new time without waiting for the next worker start.
+    const res = await chrome.runtime.sendMessage({ type: "naukri:reschedule" }).catch(() => null);
+    const when = res && res.when
+      ? new Date(res.when).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })
+      : "";
+    naukriStatus(
+      patch.naukriRefreshEnabled
+        ? `Saved. The profile refreshes daily at ${patch.naukriRefreshTime}${when ? ` — next run ${when}` : ""}.`
+        : "Saved. The daily profile refresh is off.",
+      "ok"
+    );
+  });
+
+  byId("naukri-run").addEventListener("click", () => runNaukriNow());
+
+  // The page-head button mirrors the panel's own "Refresh now" but is reachable
+  // without expanding the collapsed panel — the same shortcut the board's Find
+  // jobs button gives discovery.
+  const headerBtn = byId("update-naukri");
+  if (headerBtn) headerBtn.addEventListener("click", () => runNaukriNow());
 }
 
 // ---- job discovery panel -------------------------------------------------
@@ -861,7 +1232,10 @@ async function renderDiscoverLastRun() {
     return;
   }
 
-  const bits = [`Last searched ${Tracker.relativeTime(state.at)}`];
+  const stamp = typeof SchedulerState !== "undefined"
+    ? SchedulerState.formatStamp(state.at)
+    : new Date(state.at).toLocaleString();
+  const bits = [`Last searched ${stamp}`];
   if (state.scanned) bits.push(`${state.scanned} listings found`);
   if (state.added) bits.push(`${state.added} added`);
   if (state.updated) bits.push(`${state.updated} refreshed`);
@@ -942,6 +1316,7 @@ async function initDiscoverPanel() {
 
   const rolesEl = byId("discover-roles");
   const locationEl = byId("discover-location");
+  const hashtagsEl = byId("discover-hashtags");
   const maxEl = byId("discover-max");
   const autoEl = byId("discover-auto");
   const useAiEl = byId("discover-use-ai");
@@ -951,6 +1326,12 @@ async function initDiscoverPanel() {
 
   if (rolesEl) rolesEl.value = (settings.discoverRoles || []).join(", ");
   if (locationEl) locationEl.value = settings.discoverLocations || "";
+  if (hashtagsEl) {
+    const tags = Array.isArray(settings.discoverHashtags)
+      ? settings.discoverHashtags
+      : Discover.DEFAULT_HASHTAGS;
+    hashtagsEl.value = tags.join(", ");
+  }
   if (maxEl) maxEl.value = String(settings.discoverMaxJobs || Discover.DEFAULT_MAX_JOBS);
   if (autoEl) autoEl.checked = settings.discoverAuto !== false;
   if (useAiEl) {
@@ -977,6 +1358,10 @@ async function initDiscoverPanel() {
           .map((role) => role.trim())
           .filter(Boolean),
         discoverLocations: String((locationEl && locationEl.value) || "").trim(),
+        discoverHashtags: String((hashtagsEl && hashtagsEl.value) || "")
+          .split(/[\s,]+/)
+          .map((tag) => tag.trim().replace(/^#+/, ""))
+          .filter(Boolean),
         discoverMaxJobs: Math.max(1, Math.min(50, Number((maxEl && maxEl.value) || Discover.DEFAULT_MAX_JOBS))),
         discoverAuto: !!(autoEl && autoEl.checked),
         discoverUseAi: !!(useAiEl && useAiEl.checked)
@@ -1015,6 +1400,134 @@ async function initDiscoverPanel() {
   }
 }
 
+// ---- Cloud account panel -----------------------------------------------
+
+function accountStatus(text, kind = "") {
+  const el = byId("account-status-msg");
+  if (!el) return;
+  el.textContent = text;
+  el.className = `status-msg ${kind}`.trim();
+}
+
+// Paints the signed-in state from a session record (or null). The panel is
+// entirely a view of that one value, so there is nowhere else to look when
+// asking "is this signed in".
+function renderAccountState(session) {
+  const stateEl = byId("account-state");
+  const signinBtn = byId("account-signin");
+  const signoutBtn = byId("account-signout");
+  const noteEl = byId("account-conn-note");
+  if (!stateEl) return;
+
+  if (session) {
+    const who = session.email || session.name || "Signed in";
+    stateEl.textContent = `Signed in · ${who}`;
+    stateEl.className = "pill on";
+    if (signinBtn) signinBtn.classList.add("hidden");
+    if (signoutBtn) signoutBtn.classList.remove("hidden");
+    if (noteEl) {
+      noteEl.textContent = session.name && session.email
+        ? `Signed in as ${session.name} (${session.email}).`
+        : "Signed in. You can sign out here at any time.";
+    }
+    return;
+  }
+
+  stateEl.textContent = "Signed out";
+  stateEl.className = "pill";
+  if (signinBtn) signinBtn.classList.remove("hidden");
+  if (signoutBtn) signoutBtn.classList.add("hidden");
+  if (noteEl) noteEl.textContent = "Opens Google's consent screen and asks only for your name and email address.";
+}
+
+async function initAccountPanel() {
+  const panel = byId("account-panel");
+  if (!panel) return;
+
+  const settings = await loadPanelSettings();
+  const urlInput = byId("account-api-url");
+  const signinBtn = byId("account-signin");
+  const signoutBtn = byId("account-signout");
+
+  if (urlInput) urlInput.value = settings.cloudApiUrl || "";
+  renderAccountState(await Cloud.getSession());
+  await renderAccountLastSync();
+
+  byId("account-save").addEventListener("click", async () => {
+    const patch = { cloudApiUrl: (urlInput && urlInput.value.trim()) || "" };
+    await savePanelSettings(patch);
+    accountStatus("Saved.", "ok");
+  });
+
+  if (signinBtn) {
+    signinBtn.addEventListener("click", async () => {
+      signinBtn.disabled = true;
+      accountStatus("Waiting for Google's consent screen…", "busy");
+      try {
+        // Settings are re-read so a server URL typed since page load is used.
+        const session = await Cloud.signIn(await loadPanelSettings());
+        renderAccountState(session);
+        accountStatus(`Signed in as ${session.email || "your account"}.`, "ok");
+      } catch (err) {
+        renderAccountState(await Cloud.getSession());
+        accountStatus(err.message, "err");
+      } finally {
+        signinBtn.disabled = false;
+      }
+    });
+  }
+
+  if (signoutBtn) {
+    signoutBtn.addEventListener("click", async () => {
+      signoutBtn.disabled = true;
+      try {
+        await Cloud.signOut(await loadPanelSettings());
+        renderAccountState(null);
+        accountStatus("Signed out.", "ok");
+      } catch (err) {
+        accountStatus(err.message, "err");
+      } finally {
+        signoutBtn.disabled = false;
+      }
+    });
+  }
+
+  const syncBtn = byId("account-sync");
+  if (syncBtn) {
+    syncBtn.addEventListener("click", async () => {
+      syncBtn.disabled = true;
+      accountStatus("Syncing…", "busy");
+      try {
+        const res = await (typeof CloudSync !== "undefined" ? CloudSync.pushPull(await loadPanelSettings()) : { ok: false });
+        if (res && res.ok) {
+          await renderAccountLastSync();
+          accountStatus(res.aborted ? "Sync stopped." : "Synced.", "ok");
+          await refresh();
+        } else {
+          accountStatus((res && res.notes && res.notes[0]) || "Sync failed.", "err");
+        }
+      } catch (err) {
+        accountStatus(err.message, "err");
+      } finally {
+        syncBtn.disabled = false;
+      }
+    });
+  }
+}
+
+async function renderAccountLastSync() {
+  const el = byId("account-last-sync");
+  if (!el || typeof CloudSync === "undefined") return;
+  const last = await CloudSync.loadLastSync();
+  if (!last || !last.at) {
+    el.textContent = "Last sync: never.";
+    return;
+  }
+  el.textContent = `Last sync: ${new Date(last.at).toLocaleString()} · pushed ${last.pushed || 0}, pulled ${last.pulled || 0}.`;
+}
+
 refresh();
+initAccountPanel().catch((err) => accountStatus(err.message, "err"));
 initMailPanel().catch((err) => mailStatus(err.message, "err"));
+initNaukriPanel().catch((err) => naukriStatus(err.message, "err"));
 initDiscoverPanel().catch((err) => discoverStatus(err.message, "err"));

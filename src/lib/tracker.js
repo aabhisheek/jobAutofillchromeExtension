@@ -42,6 +42,8 @@ const SOURCE_PATTERNS = [
   [/\bindeed\.com/i, "Indeed"],
   [/\bdocs\.google\.com\/forms|\bgoogle\.com\/forms/i, "Google Forms"],
   [/\blinkedin\.com\/jobs/i, "LinkedIn"],
+  [/\blinkedin\.com\/(posts|feed|pulse|search)/i, "LinkedIn"],
+  [/\b(x|twitter)\.com\//i, "X (Twitter)"],
   [/\bgithub\.com/i, "GitHub"],
   [/\bcareers\./i, "Careers"],
   [/\b(job|career|jobs)\b/i, "Careers"]
@@ -352,6 +354,22 @@ async function setApplicationStatus(id, status) {
   return items[index];
 }
 
+// Overwrites arbitrary fields on one row, by id, with no rank guard and no
+// matching. This is the deliberate exception to upsertApplication's "an import
+// can never demote a card" rule: the AI re-check pass exists to correct a stage
+// a local parse got wrong, and half of those corrections move a card backwards
+// (an interview guessed from boilerplate that was really just a received
+// confirmation). `emailAt`, when given, is the mail's own date, so a moved card
+// is stamped with when the event happened rather than when the re-check ran.
+async function applyApplicationFields(id, fields = {}) {
+  const items = await listApplications();
+  const index = items.findIndex((item) => item.id === id);
+  if (index === -1) return null;
+  items[index] = normalizeApplication({ ...fields }, items[index]);
+  await writeApplications(items);
+  return items[index];
+}
+
 async function deleteApplication(id) {
   const items = await listApplications();
   const next = items.filter((item) => item.id !== id);
@@ -360,8 +378,29 @@ async function deleteApplication(id) {
   return true;
 }
 
-async function clearApplications() {
-  await chrome.storage.local.set({ [APPLICATIONS_KEY]: [] });
+async function mergeRemote(remoteApps = []) {
+  const local = await listApplications();
+  const byId = new Map(local.map((app) => [app.id, app]));
+  let changed = false;
+  for (const remote of remoteApps) {
+    if (!remote || typeof remote !== "object" || !remote.id) continue;
+    const existing = byId.get(remote.id);
+    if (!existing) {
+      byId.set(remote.id, normalizeApplication(remote));
+      changed = true;
+      continue;
+    }
+    const remoteUpdated = Number.isFinite(remote.updatedAt) ? remote.updatedAt : 0;
+    const localUpdated = Number.isFinite(existing.updatedAt) ? existing.updatedAt : 0;
+    if (remoteUpdated >= localUpdated) {
+      byId.set(remote.id, normalizeApplication(remote, existing));
+      changed = true;
+    }
+  }
+  if (!changed) return { changed: false, items: Array.from(byId.values()) };
+  const merged = Array.from(byId.values());
+  await writeApplications(merged);
+  return { changed: true, items: merged };
 }
 
 // ---- Popup integration -------------------------------------------------
@@ -495,6 +534,10 @@ function isoOrEmpty(ts) {
   return Number.isFinite(ts) ? new Date(ts).toISOString() : "";
 }
 
+async function clearApplications() {
+  await chrome.storage.local.set({ [APPLICATIONS_KEY]: [] });
+}
+
 const Tracker = {
   STATUSES: APPLICATION_STATUSES,
   COLUMNS: APPLICATION_COLUMNS,
@@ -503,7 +546,9 @@ const Tracker = {
   save: upsertApplication,
   matchIndex,
   setStatus: setApplicationStatus,
+  applyFields: applyApplicationFields,
   remove: deleteApplication,
+  mergeRemote,
   clear: clearApplications,
   trackActiveTab,
   sourceFromUrl,
