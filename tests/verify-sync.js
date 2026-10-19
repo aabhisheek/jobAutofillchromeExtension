@@ -516,7 +516,7 @@ const { eq, done } = expect("sync");
   eq("AI-only cap: the board holds only the enriched card", (await T.list()).length, 1);
 
   // ---- 16. a failing provider is retried, then the next one takes over ----
-  // Groq answers 500 on every attempt; DeepSeek, configured as the second
+  // DeepSeek answers 500 on every attempt; Groq, configured as the second
   // provider, answers. The email must still be read by AI, and the run must
   // record no AI failure.
   await T.clear(); await M.ledger.clear(); MESSAGES.length = 0;
@@ -526,9 +526,9 @@ const { eq, done } = expect("sync");
   const realFetchRotate = ctx.fetch;
   aiCalls = 0;
   ctx.fetch = async (url, init) => {
-    if (String(url).includes("groq.com")) {
+    if (String(url).includes("deepseek.com")) {
       aiCalls += 1;
-      return { ok: false, status: 500, text: async () => "groq down", json: async () => ({}) };
+      return { ok: false, status: 500, text: async () => "deepseek down", json: async () => ({}) };
     }
     return realFetchRotate(url, init);
   };
@@ -538,7 +538,7 @@ const { eq, done } = expect("sync");
   ctx.fetch = realFetchRotate;
   eq("rotation: the second provider still imports the card", rotated.added, 1);
   eq("rotation: no AI failure is recorded", rotated.aiFailed, 0);
-  eq("rotation: groq was retried before the switch (3 tries + 1 deepseek call)", aiCalls, 4);
+  eq("rotation: deepseek was retried before the switch (3 tries + 1 groq call)", aiCalls, 4);
   eq("rotation: the card is marked AI-read", rotated.aiEnriched, 1);
 
   // ---- 10. state is written for the panel to render ----

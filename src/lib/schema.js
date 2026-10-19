@@ -210,6 +210,8 @@ const DEFAULT_SETTINGS = {
   geminiModel: "gemini-flash-latest",
   deepseekApiKey: "",
   deepseekModel: "deepseek-chat",
+  siliconflowApiKey: "",
+  siliconflowModel: "Qwen/Qwen2.5-7B-Instruct",
   openrouterApiKey: "",
   openrouterModel: "anthropic/claude-3.5-sonnet",
   togetherApiKey: "",

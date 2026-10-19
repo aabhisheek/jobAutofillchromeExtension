@@ -6,22 +6,34 @@
 // and the origin permissions the manifest asks for. Adding a provider is a new
 // entry here plus its host permission in manifest.json — no branching anywhere.
 //
-// Array order IS the preference order the draft path walks: free and cheap
-// providers first, paid ones last as the safety net. Reorder this array to
-// change that everywhere at once.
+// Array order IS the preference order the draft path walks: Grok first, then
+// OpenRouter, Gemini and DeepSeek, with the remaining providers after them as
+// fallbacks. Reorder this array to change that everywhere at once.
 
 const AI_PROVIDERS = [
   {
-    id: "groq",
-    label: "Groq",
-    blurb: "Free tier, very fast. Good default for bulk drafting.",
-    keyLabel: "Groq API key",
-    keyPlaceholder: "gsk_…",
-    modelLabel: "Groq model",
-    modelPlaceholder: "openai/gpt-oss-120b",
-    defaultModel: "openai/gpt-oss-120b",
-    docs: "console.groq.com/keys",
-    origin: "https://api.groq.com/*"
+    id: "xai",
+    label: "xAI (Grok)",
+    blurb: "Grok models, OpenAI-compatible API.",
+    keyLabel: "xAI API key",
+    keyPlaceholder: "xai-…",
+    modelLabel: "xAI model",
+    modelPlaceholder: "grok-2-latest",
+    defaultModel: "grok-2-latest",
+    docs: "console.x.ai",
+    origin: "https://api.x.ai/*"
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    blurb: "One key, every model on its marketplace.",
+    keyLabel: "OpenRouter API key",
+    keyPlaceholder: "sk-or-…",
+    modelLabel: "OpenRouter model",
+    modelPlaceholder: "anthropic/claude-3.5-sonnet",
+    defaultModel: "anthropic/claude-3.5-sonnet",
+    docs: "openrouter.ai/keys",
+    origin: "https://openrouter.ai/*"
   },
   {
     id: "gemini",
@@ -48,16 +60,28 @@ const AI_PROVIDERS = [
     origin: "https://api.deepseek.com/*"
   },
   {
-    id: "openrouter",
-    label: "OpenRouter",
-    blurb: "One key, every model on its marketplace.",
-    keyLabel: "OpenRouter API key",
-    keyPlaceholder: "sk-or-…",
-    modelLabel: "OpenRouter model",
-    modelPlaceholder: "anthropic/claude-3.5-sonnet",
-    defaultModel: "anthropic/claude-3.5-sonnet",
-    docs: "openrouter.ai/keys",
-    origin: "https://openrouter.ai/*"
+    id: "siliconflow",
+    label: "SiliconFlow",
+    blurb: "Low-cost GPU cloud, OpenAI-compatible API.",
+    keyLabel: "SiliconFlow API key",
+    keyPlaceholder: "sk-…",
+    modelLabel: "SiliconFlow model",
+    modelPlaceholder: "Qwen/Qwen2.5-7B-Instruct",
+    defaultModel: "Qwen/Qwen2.5-7B-Instruct",
+    docs: "cloud.siliconflow.cn/account/ak",
+    origin: "https://api.siliconflow.cn/*"
+  },
+  {
+    id: "groq",
+    label: "Groq",
+    blurb: "Free tier, very fast. Good default for bulk drafting.",
+    keyLabel: "Groq API key",
+    keyPlaceholder: "gsk_…",
+    modelLabel: "Groq model",
+    modelPlaceholder: "openai/gpt-oss-120b",
+    defaultModel: "openai/gpt-oss-120b",
+    docs: "console.groq.com/keys",
+    origin: "https://api.groq.com/*"
   },
   {
     id: "together",
@@ -82,18 +106,6 @@ const AI_PROVIDERS = [
     defaultModel: "mistral-small-latest",
     docs: "console.mistral.ai/api-keys",
     origin: "https://api.mistral.ai/*"
-  },
-  {
-    id: "xai",
-    label: "xAI (Grok)",
-    blurb: "Grok models, OpenAI-compatible API.",
-    keyLabel: "xAI API key",
-    keyPlaceholder: "xai-…",
-    modelLabel: "xAI model",
-    modelPlaceholder: "grok-2-latest",
-    defaultModel: "grok-2-latest",
-    docs: "console.x.ai",
-    origin: "https://api.x.ai/*"
   },
   {
     id: "custom",
@@ -145,6 +157,7 @@ const PROVIDER_FAMILY = {
   groq: "openai",
   gemini: "gemini",
   deepseek: "openai",
+  siliconflow: "openai",
   openrouter: "openai",
   together: "openai",
   mistral: "openai",
@@ -159,6 +172,7 @@ const PROVIDER_ENDPOINT = {
   groq: "https://api.groq.com/openai/v1/chat/completions",
   gemini: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
   deepseek: "https://api.deepseek.com/chat/completions",
+  siliconflow: "https://api.siliconflow.cn/v1/chat/completions",
   openrouter: "https://openrouter.ai/api/v1/chat/completions",
   together: "https://api.together.xyz/v1/chat/completions",
   mistral: "https://api.mistral.ai/v1/chat/completions",
@@ -172,6 +186,7 @@ const PROVIDER_ENDPOINT = {
 const PROVIDER_MAX_TOKENS_KEY = {
   groq: "max_completion_tokens",
   deepseek: "max_tokens",
+  siliconflow: "max_tokens",
   openrouter: "max_tokens",
   together: "max_tokens",
   mistral: "max_tokens",
@@ -267,9 +282,10 @@ function configuredProviders(settings) {
 
 // ---- Sending a prompt -------------------------------------------------
 //
-// One function per wire-format family instead of one per vendor: eight of the
-// ten entries above speak the OpenAI chat-completions shape, so Groq, DeepSeek,
-// OpenRouter, Together, Mistral, xAI, OpenAI and a self-hosted server are all
+// One function per wire-format family instead of one per vendor: nine of the
+// eleven entries above speak the OpenAI chat-completions shape, so Groq, DeepSeek,
+// SiliconFlow, OpenRouter, Together, Mistral, xAI, OpenAI and a self-hosted server
+// are all
 // the same three lines of JSON with a different URL. Both callers — the draft
 // path in draft.js and the "Test" button on the keys screen — go through here,
 // so a provider that works when tested is the same provider that works when

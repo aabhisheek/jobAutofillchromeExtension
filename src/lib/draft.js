@@ -207,11 +207,11 @@ function isSkipResponse(text) {
 // would otherwise produce a value the filler cannot match, and the failure would
 // surface as a silently unfilled box rather than as an obvious error.
 
-// Providers in preference order, cheapest first. The list is not written here:
+// Providers in preference order — Grok, OpenRouter, Gemini, DeepSeek, then the
+// rest. The list is not written here:
 // it comes from src/lib/providers.js, which the API Keys screen renders from too,
 // so a provider added there is draftable here with no second edit. Array order in
-// that file is the order below — free tiers first, paid ones last as the safety
-// net.
+// that file is the order below.
 //
 // maxTokens is a *floor* for the batch call, not a ceiling, and most providers
 // never see it: one reply has to carry an answer per field, so wherever the API
@@ -357,8 +357,8 @@ async function chooseOptions(row, profile, settings, customContext = undefined) 
   throw new Error(errors.join(" — then — "));
 }
 
-// Single entry point used by popup.js. Providers are tried cheapest first — the
-// order comes from src/lib/providers.js, free tiers ahead of paid ones.
+// Single entry point used by popup.js. Providers are tried in the preference
+// order from src/lib/providers.js — Grok, OpenRouter, Gemini, DeepSeek, rest.
 //
 // A provider answering SKIP counts as a miss rather than an error, so the next
 // one still gets a turn. If every provider declines, the field is genuinely

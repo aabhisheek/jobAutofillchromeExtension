@@ -116,8 +116,9 @@ function extractKeywordsWith(provider, jdText, settings) {
   }).then(parseKeywordJSON);
 }
 
-// Single entry point. Providers are tried cheapest-first, in the catalog's order
-// (free tiers ahead of paid ones). Always falls back to the local dictionary if
+// Single entry point. Providers are tried in the catalog's preference order
+// (Grok, OpenRouter, Gemini, DeepSeek, then the rest). Always falls back to the
+// local dictionary if
 // the LLM is off, unconfigured, or every provider errors out — extraction never
 // hard-fails.
 async function extractKeywords(jdText, profile, settings) {
