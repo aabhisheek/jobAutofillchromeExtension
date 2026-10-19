@@ -25,6 +25,13 @@ function makePage({ controls = 0, shadowControls = 0, href = "https://jobs.examp
   const timers = new Map();
   let observerCallback = null;
 
+  // A gesture listener registry, so a test can fire a click/keypress the way a
+  // user would and watch the content script ask for the panel to open.
+  const listeners = new Map();
+  function listenersFor(type) {
+    return listeners.get(type) || [];
+  }
+
   const document = {
     documentElement: {},
     querySelectorAll(selector) {
@@ -40,6 +47,14 @@ function makePage({ controls = 0, shadowControls = 0, href = "https://jobs.examp
         }];
       }
       return [];
+    },
+    addEventListener(type, fn, opts) {
+      const capture = typeof opts === "boolean" ? opts : !!(opts && opts.capture);
+      const once = !!(opts && opts.once);
+      listeners.set(type, [...listenersFor(type), { fn, capture, once }]);
+    },
+    removeEventListener(type, fn) {
+      listeners.set(type, listenersFor(type).filter((entry) => entry.fn !== fn));
     }
   };
 
@@ -85,7 +100,19 @@ function makePage({ controls = 0, shadowControls = 0, href = "https://jobs.examp
       const fns = [...timers.values()];
       timers.clear();
       fns.forEach((fn) => fn());
-    }
+    },
+    // Fire a page gesture at the listeners the content script registered,
+    // honouring `once` the way the DOM does.
+    gesture(type) {
+      const list = [...listenersFor(type)];
+      for (const entry of list) {
+        entry.fn({ type });
+        if (entry.once) {
+          listeners.set(type, listenersFor(type).filter((e) => e !== entry));
+        }
+      }
+    },
+    listenerCount: (type) => listenersFor(type).length
   };
 }
 
@@ -157,5 +184,47 @@ eq("…with the crossing count", growing.sent[0].controlCount, 3);
 const noReceiver = makePage({ controls: 5, rejectMessages: true });
 noReceiver.flush();
 ok("a report with no listener is not an error", noReceiver.sent.length === 1);
+
+// ---- auto-open -------------------------------------------------------------
+//
+// A form arms a one-time gesture; the panel is opened from the first real
+// click or keypress, because that is the only gesture chrome.sidePanel.open()
+// accepts. The detection report itself (sent above) opens nothing.
+
+const auto = makePage({ controls: 5 });
+ok("a form arms a pointerdown listener for auto-open", auto.listenerCount("pointerdown") === 1);
+ok("…and a keydown listener", auto.listenerCount("keydown") === 1);
+eq("arming alone sends nothing extra", auto.sent.length, 1);
+
+auto.gesture("pointerdown");
+eq("the first click asks to open the panel", auto.sent.length, 2);
+eq("…with the open-panel message", auto.sent[1], {
+  type: "autofill:open-panel",
+  href: "https://jobs.example.com/apply"
+});
+eq("…and disarms the gesture listeners", auto.listenerCount("pointerdown"), 0);
+
+auto.gesture("keydown");
+eq("a later gesture does not ask again", auto.sent.length, 2);
+
+// A keypress works when it is the first interaction instead of a click.
+const keyboard = makePage({ controls: 4 });
+keyboard.gesture("keydown");
+eq("the first keypress also opens the panel", keyboard.sent.length, 2);
+eq("…with the open-panel message", keyboard.sent[1].type, "autofill:open-panel");
+
+// A form that appears after load arms too — a page that hydrates its form.
+const late = makePage({ controls: 2 });
+eq("a search box arms nothing", late.listenerCount("pointerdown"), 0);
+late.mutate({ controls: 6 });
+late.flush();
+eq("a late form arms a gesture", late.listenerCount("pointerdown"), 1);
+late.gesture("pointerdown");
+ok("…and opens", late.sent.some((m) => m.type === "autofill:open-panel"));
+
+// Auto-open survives an absent/gated panel: the send is fire-and-forget.
+const refused = makePage({ controls: 5, rejectMessages: true });
+refused.gesture("pointerdown");
+ok("a refused open-panel send is not an error", refused.sent.filter((m) => m.type === "autofill:open-panel").length === 1);
 
 process.exit(done() ? 1 : 0);

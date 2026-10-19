@@ -213,8 +213,8 @@ const LIB_DEPS = {
   "learned.js": ["schema.js", "matcher.js"],
   "draft.js": ["schema.js", "matcher.js"],
   "resume-tailor.js": ["schema.js", "providers.js"],
-  "mail-import.js": ["schema.js", "providers.js", "tracker.js"],
-  "discover.js": ["schema.js", "providers.js", "tracker.js", "mail-import.js", "resume-tailor.js", "page-scripts.js"],
+  "mail-import.js": ["schema.js", "providers.js", "tracker.js", "scheduler-state.js"],
+  "discover.js": ["schema.js", "providers.js", "tracker.js", "scheduler-state.js", "mail-import.js", "resume-tailor.js", "page-scripts.js"],
   "registry.js": [
     "generic.js",
     "workday.js",

@@ -286,6 +286,30 @@ const DEFAULT_SETTINGS = {
   // never reaches the model.
   contextFilePath: "",
 
+  // ---- Cloud account ----
+  //
+  // Base URL of the sign-in backend (see server/). Empty means "use the
+  // bundled default" — Cloud.DEFAULT_API_URL, which points at the local
+  // development server. Set a real deployment URL from the dashboard's Account
+  // panel. Kept as a key with an empty value rather than dropped, because
+  // mergeSettings only honours a stored override for a key it knows.
+  cloudApiUrl: "",
+
+  // ---- Supabase (data sync) ----
+  //
+  // The project the extension uploads to and downloads from. Both values live
+  // in src/data/settings.json (bundled) or can be overridden per-install from
+  // the dashboard's Account panel. The anon key is a public, browser-safe
+  // credential by Supabase's design — it ships in client-side code — but with
+  // no Supabase Auth on the extension side it doubles as the sync secret, so
+  // treat it accordingly. See supabase/schema.sql for the RLS split.
+  //
+  // Empty means "not configured" — CloudSync.pushPull refuses to run and the
+  // background alarm stays disarmed, so nothing is ever sent to a default or
+  // guessed project.
+  supabaseUrl: "",
+  supabaseAnonKey: "",
+
   // ---- Email import (Gmail) ----
   //
   // Reads application-confirmation emails and turns them into rows on the
@@ -295,19 +319,25 @@ const DEFAULT_SETTINGS = {
   // dashboard's "Import from Gmail" panel.
   //
   // gmailClientId is Google's OAuth *client* id for this extension, not the
-  // user's id: a public client from console.cloud.google.com with type
-  // "Chrome Extension". It is not a secret and it is the one field that has to
-  // be copied from a Google Cloud project before anything else here can run.
+  // user's id. It is NOT configured in any UI: the client ships in
+  // src/data/google-oauth.json (gitignored, alongside this file) and gmail.js
+  // resolves it from there, so a shared build connects with the author's client
+  // and each user has only to press Connect. This field is kept as a fallback
+  // for installs that wired a client up before that file existed; new setups
+  // leave it empty.
   gmailClientId: "",
   // Only needed by Google Cloud "Web application" client ids, whose token
-  // endpoint rejects the exchange with `client_secret is missing`. A
-  // "Chrome Extension" client id has no secret and leaves this blank.
-  //
-  // Treat it as a public value, which is Google's own position for installed
-  // apps: "…you embed in the source code of your application. (In this context,
-  // the client secret is obviously not treated as a secret.)" It is kept in
-  // chrome.storage.local so it never reaches this repository, which is public.
+  // endpoint rejects the exchange with `client_secret is missing`. Treat it as
+  // a public value, which is Google's own position for installed apps: "…you
+  // embed in the source code of your application. (In this context, the client
+  // secret is obviously not treated as a secret.)" Real value: the bundled
+  // google-oauth.json.
   gmailClientSecret: "",
+  // Retained for the same fallback path. The runtime derives the real extension
+  // id and redirect URI (chrome.runtime.id / chrome.identity.getRedirectURL()),
+  // and what Google Cloud has to have registered is recorded in google-oauth.json.
+  extensionId: "",
+  redirectUri: "",
   // The Gmail search the daily sync runs. A raw Gmail query, so the user can
   // tune it to the exact phrasing their target employers send. The default
   // covers the phrasing that actually shows up in confirmation mails across
@@ -322,7 +352,7 @@ const DEFAULT_SETTINGS = {
     'newer_than:30d {"application received" "application submitted" "we have received your application" "thank you for applying" "we received your application"}',
   // Wall-clock time for the daily run, "HH:MM" in the machine's local zone.
   // Chrome alarms only fire while the browser is running; an alarm that was
-  // missed is not replayed, which is why the panel also offers Sync now.
+  // missed is not replayed, which is why the panel also offers Read & Sync.
   emailSyncTime: "09:00",
   // How often the background check runs: "1h", "2h" or "daily" (at the
   // emailSyncTime above, which also anchors the interval schedules' first
@@ -339,15 +369,34 @@ const DEFAULT_SETTINGS = {
   // clean {title, company, status}. Off falls back to the purely local parse,
   // which is free and never leaves the machine.
   emailUseAi: true,
-  // Ceiling on AI calls per sync, because every parsed email is one billable
-  // request and a large backlog would otherwise spend real money unattended.
-  // Anything over the cap is still imported — just with the local parse.
+  // Ceiling on how many emails one *scheduled* sync sends to AI, because every
+  // parsed email costs a request and a large backlog would otherwise spend real
+  // money unattended. The manual Read & Sync / Reset & rebuild ignores this and
+  // reads the whole window, since those are deliberate clicks. An email over the
+  // cap is not imported at all when emailRequireAi is on — it waits for a later
+  // run — and falls back to the local parse only when emailRequireAi is off.
   emailMaxAiPerRun: 20,
+  // Only put a card on the board when AI actually read its email. Off means an
+  // email the AI could not read (over the cap, or every provider failing) is
+  // still imported from the local parse. On means such an email is skipped and
+  // retried on the next sync instead, so the board only ever holds AI-checked
+  // cards. Has no effect while Use AI is switched off.
+  emailRequireAi: true,
   // How many days of mail a sync looks at. The query's own newer_than: term is
   // the real bound; this is the belt-and-braces one, and it also stops a
   // hand-edited query that dropped its date filter from importing a decade.
   emailLookbackDays: 30,
 
+  // ---- Naukri profile refresh (daily) ------------------------------
+  // Opens the already logged-in Naukri profile-edit URL in a background tab at
+  // naukriRefreshTime, appends a dot to the bio if it does not end with one,
+  // saves, and closes the tab. No login flow and nothing else on the profile
+  // is touched. Off means the alarm is cleared and nothing runs.
+  naukriRefreshEnabled: true,
+  naukriRefreshTime: "08:00", // HH:MM in local timezone
+  naukriRefreshUrl: "https://www.naukri.com/mnjuser/profile",
+  naukriRefreshEditPattern: "dots", // "dots" | "append" | "custom"
+  naukriRefreshCustomText: " .",
   // ---- job discovery -------------------------------------------------
   // The roles the user wants to be found. Each one becomes a jobs search on
   // LinkedIn (and other boards), and the results are scored against the
@@ -368,7 +417,13 @@ const DEFAULT_SETTINGS = {
   // Score the shortlist chance with the configured AI provider when there is
   // one. Off (or unconfigured) still yields the local match score and stars;
   // this only replaces the "chance of shortlist" number and adds reasons.
-  discoverUseAi: true
+  discoverUseAi: true,
+  // Hashtags whose social posts are curated alongside the board searches —
+  // #hiring, #ITjobs, #SDE on LinkedIn's content search and on X. Recruiters
+  // post roles there first, so a run reads those feeds too and folds the
+  // genuine job posts into the same scored pool. An explicitly empty list turns
+  // the feeds off and leaves only the board searches.
+  discoverHashtags: ["hiring", "ITjobs", "SDE"]
 };
 
 // Extensions accepted for the bundled context file. Plain text only: the
@@ -383,15 +438,20 @@ const CONTEXT_FILE_EXTENSIONS = [".md", ".txt", ".markdown"];
 // via the UI, instead of one saved settings record shadowing the whole file.
 // Note only "" is treated as unset, so a `false` override (e.g. turning
 // analyticsEnabled off) correctly wins over a bundled `true`.
+//
+// Two fields are exempt from the "" rule: draftContext is cleared on purpose
+// from its own UI, and the Gmail credentials must be able to override the
+// bundled google-oauth.json fallback with "unset", so a clear that came back
+// with the old value still in place would be a lie.
 function mergeSettings(bundled, override) {
   const merged = { ...DEFAULT_SETTINGS, ...bundled };
   if (!override) return merged;
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     const value = override[key];
     if (value !== undefined) {
-      if (key === "draftContext") {
-        merged[key] = value;
-      } else if (value !== "") {
+      const clearable =
+        key === "draftContext" || key === "gmailClientId" || key === "gmailClientSecret";
+      if (clearable || value !== "") {
         merged[key] = value;
       }
     }

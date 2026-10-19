@@ -82,24 +82,27 @@
             </form>
           </details>
 
-          <!-- Cloud account: sign in with Google so the extension has an
-               identity to talk to the backend with. Not open by default — the
-               board works fully without signing in, and the panel is here for
-               when the user wants it, not as a gate. -->
+          <!-- Cloud account: sign in with Google (the extension's own sign-in),
+               then point the sync at a Supabase project. Rows are keyed on the
+               sign-in email with the project's anon key, so a board synced here
+               shows up on the website and the other way round. Not open by
+               default: the board works fully without signing in, and the panel
+               is not a gate. -->
           <details class="card add-panel" id="account-panel">
-            <summary>Account</summary>
+            <summary>Account &amp; Sync</summary>
             <div class="mail-steps">
               <div class="mail-step">
                 <p class="panel-note">
-                  Sign in with Google to give the extension an account. The board keeps working
-                  without it; signing in is what lets your data follow you across devices later.
-                  Nothing on this board is uploaded yet.
+                  Sign in with Google. Your profile, resume and application board then sync to
+                  Supabase and appear on the website (and the site's changes come back here). The
+                  board keeps working without signing in — everything stays in this browser until
+                  you do.
                 </p>
 
                 <div class="conn-row">
                   <span id="account-state" class="pill">Signed out</span>
                   <span class="conn-actions">
-                    <button type="button" id="account-signin" class="primary">Sign in with Google</button>
+                    <button type="button" id="account-signin" class="primary">Continue with Google</button>
                     <button type="button" id="account-signout" class="ghost hidden">Sign out</button>
                   </span>
                 </div>
@@ -107,11 +110,18 @@
                   Opens Google's consent screen and asks only for your name and email address.
                 </p>
 
-                <label class="field-label" for="account-api-url">Server address</label>
-                <input type="url" id="account-api-url" spellcheck="false" placeholder="http://localhost:8787" />
+                <label class="field-label" for="account-supabase-url">Supabase project URL</label>
+                <input type="url" id="account-supabase-url" spellcheck="false" placeholder="https://xxxx.supabase.co" />
                 <p class="panel-hint">
-                  Where the extension sends sign-in requests. Leave empty to use the built-in
-                  default. Set this to your deployed server's address.
+                  The Project URL from your Supabase project's API settings.
+                </p>
+
+                <label class="field-label" for="account-supabase-key">Supabase anon key</label>
+                <input type="text" id="account-supabase-key" spellcheck="false" placeholder="eyJhbGciOi…" autocomplete="off" />
+                <p class="panel-hint">
+                  The public <code>anon</code> / <code>publishable</code> key from the same page.
+                  With no Supabase Auth on this side it also acts as the sync credential, so keep
+                  the project URL and key together.
                 </p>
 
                 <div class="toolbar add-actions">
@@ -438,6 +448,7 @@
     <script src="../lib/scheduler-state.js"></script>
     <script src="../lib/gmail.js"></script>
     <script src="../lib/cloud.js"></script>
+    <script src="../lib/supabase.js"></script>
     <script src="../lib/cloud-sync.js"></script>
     <script src="../lib/mail-import.js"></script>
     <script src="../lib/ai-evals.js"></script>

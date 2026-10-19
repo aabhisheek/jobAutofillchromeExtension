@@ -101,6 +101,7 @@ function makeContext(extra = {}) {
     setTimeout, clearTimeout,
     Date, Math, JSON, RegExp,
     String, Number, Boolean, Object, Array, Promise, Error, Map, Set,
+    AbortController, AbortSignal,
     ...extra.globals
   });
 }

@@ -25,11 +25,25 @@ for (let i = 0; i < 20; i += 1) {
 }
 LINKEDIN[0].snippet = "Stack: Node.js, PostgreSQL on AWS.";
 
-// Indeed: four URL-duplicates of LinkedIn (must dedupe away) plus ten unique
-// senior-role matches.
+// Indeed: four URL-duplicates of LinkedIn (must dedupe away), ten unique
+// senior-role matches, and three internships that a professional search must
+// skip even though their titles would otherwise score as role matches.
 const INDEED = [];
 for (let i = 0; i < 4; i += 1) INDEED.push(listing(i, "Backend Engineer"));
 for (let i = 20; i < 30; i += 1) INDEED.push(listing(i, "Senior Backend Engineer"));
+for (let i = 30; i < 33; i += 1) INDEED.push(listing(i, "Backend Engineer Intern"));
+
+// Feeds: hashtag posts. Five read like real hiring posts and one is noise that
+// must not become a card; the last one carries an external apply link in place
+// of a permalink, which is the shape the feed scanner prefers.
+const FEED = [
+  { url: "https://x.com/recruiter/status/1001", title: "We're hiring a Backend Engineer", company: "", location: "", snippet: "Node.js and PostgreSQL on AWS. Apply now." },
+  { url: "https://x.com/recruiter/status/1002", title: "Hiring: Data Engineer", company: "", location: "", snippet: "Open position, apply now." },
+  { url: "https://www.linkedin.com/posts/acme-2001", title: "Join our team as a Backend Engineer", company: "", location: "", snippet: "We're looking for a Backend Engineer. AWS, Node.js." },
+  { url: "https://www.linkedin.com/posts/acme-2002", title: "Frontend Developer opening", company: "", location: "", snippet: "React and TypeScript role. Apply now." },
+  { url: "https://jobs.example.com/posting/900", title: "Backend Engineer", company: "", location: "", snippet: "Node.js, PostgreSQL, AWS. Hiring now." },
+  { url: "https://x.com/celebrations/status/1003", title: "Congratulations to our team", company: "", location: "", snippet: "So proud of everyone this quarter." }
+];
 
 // ---- chrome mock ---------------------------------------------------------
 
@@ -55,12 +69,19 @@ chromeMock.tabs.remove = async (id) => {
   openTabs.delete(id);
 };
 // The injected reader is replaced wholesale: what matters here is the engine's
-// tab lifecycle and what it does with a listing set, not LinkedIn's DOM.
+// tab lifecycle and what it does with a listing set, not LinkedIn's DOM. The
+// feed tabs are routed to the canned feed posts instead of the board listings.
+const scannedFuncs = [];
 chromeMock.scripting = {
-  executeScript: async ({ target }) => {
+  executeScript: async ({ target, func }) => {
+    scannedFuncs.push(func && func.name);
     const tab = openTabs.get(target.tabId);
     const url = (tab && tab.url) || "";
-    const source = url.includes("linkedin") ? LINKEDIN : url.includes("indeed") ? INDEED : [];
+    const source =
+      url.includes("/jobs/search") ? LINKEDIN
+      : url.includes("indeed.com/jobs") ? INDEED
+      : url.includes("x.com") || url.includes("/search/results/content") ? FEED
+      : [];
     return [{ result: source.map((item) => ({ ...item })) }];
   }
 };
@@ -146,34 +167,75 @@ const { eq, ok, done } = expect("discover");
 
   console.log("--- search plan ---");
   const plan = D.searchPlan(["Backend Engineer", "Data Engineer", "SRE"], { discoverLocations: "Bangalore" });
-  eq("capped at 4 tabs", plan.length, 4);
+  const boards = plan.filter((p) => p.kind !== "feed");
+  const feeds = plan.filter((p) => p.kind === "feed");
+  eq("board tabs capped at 4", boards.length, 4);
   eq("LinkedIn first", plan[0].site, "LinkedIn");
   ok("role in the url", plan[0].url.includes("Backend%20Engineer"));
   ok("location in the url", plan[0].url.includes("Bangalore"));
-  eq("all LinkedIn before Indeed", plan.filter((p) => p.site === "LinkedIn").length, 3);
+  eq("all LinkedIn before Indeed", boards.filter((p) => p.site === "LinkedIn").length, 3);
+  ok("LinkedIn targets early career (entry + associate)",
+     plan[0].url.includes("f_E=2%2C3"));
+  const indeedPlan = plan.find((p) => p.site === "Indeed");
+  ok("Indeed targets entry level", indeedPlan.url.includes("explvl=entry_level"));
+
+  console.log("--- hashtag feeds ---");
+  eq("feeds appended after the boards", feeds.length, 2);
+  eq("LinkedIn content search first", feeds[0].site, "LinkedIn Posts");
+  ok("LinkedIn feed searches the hashtags",
+     feeds[0].url.includes("linkedin.com/search/results/content"));
+  ok("LinkedIn feed queries #hiring", feeds[0].url.includes("%23hiring"));
+  eq("X second", feeds[1].site, "X (Twitter)");
+  ok("X feed uses the Latest tab", feeds[1].url.includes("f=live"));
+  eq("default hashtags", D.normalizeHashtags({}), ["hiring", "ITjobs", "SDE"]);
+  eq("string input and # stripped",
+     D.normalizeHashtags({ discoverHashtags: "#hiring, itjobs" }), ["hiring", "itjobs"]);
+  eq("duplicates collapse case-insensitively",
+     D.normalizeHashtags({ discoverHashtags: ["SDE", "sde", "Dev"] }), ["SDE", "Dev"]);
+  eq("an explicit empty list turns feeds off",
+     D.normalizeHashtags({ discoverHashtags: [] }), []);
+  eq("no feed tabs when hashtags are empty", D.feedPlan({ discoverHashtags: [] }).length, 0);
+  eq("no feed tabs in the plan either",
+     D.searchPlan(["Backend Engineer"], { discoverHashtags: [] }).length, 2);
 
   console.log("--- roles fall back to the profile ---");
   eq("explicit roles win", D.normalizeRoles({ discoverRoles: ["SRE"] }, profile), ["SRE"]);
   eq("empty roles fall back to experience titles",
      D.normalizeRoles({ discoverRoles: [] }, profile), ["Backend Engineer"]);
   eq("nothing at all yields nothing", D.normalizeRoles({ discoverRoles: [] }, {}), []);
+  eq("an intern title is dropped from the fallback",
+     D.normalizeRoles({ discoverRoles: [] },
+       { experience: [{ title: "Software Engineer Intern" }, { title: "Software Engineer" }] }),
+     ["Software Engineer"]);
+  eq("an all-intern history yields nothing",
+     D.normalizeRoles({ discoverRoles: [] }, { experience: [{ title: "Software Engineer Intern" }] }), []);
+  eq("an intern role typed by the user is still honored",
+     D.normalizeRoles({ discoverRoles: ["Software Engineer Intern"] }, profile),
+     ["Software Engineer Intern"]);
 
-  console.log("--- full run: top 20 of 30 listings ---");
+  console.log("--- full run: top 20 of 30 board listings + 6 posts ---");
   const report = await D.run({ settings: baseSettings, profile });
   eq("ok", report.ok, true);
-  eq("scanned (duplicates removed)", report.scanned, 30);
-  eq("four tabs opened", report.tabs, 4);
-  eq("all four closed", removedTabs.length, 4);
+  eq("scanned (duplicates removed)", report.scanned, 36);
+  eq("six tabs opened (four boards + two feeds)", report.tabs, 6);
+  eq("all six closed", removedTabs.length, 6);
+  eq("four tabs used the board scanner",
+     scannedFuncs.filter((name) => name === "scanJobListings").length, 4);
+  eq("two tabs used the feed scanner",
+     scannedFuncs.filter((name) => name === "scanFeedPosts").length, 2);
   eq("no AI on this run", report.aiScored, 0);
   eq("capped at 20 added", report.added, 20);
 
   let board = await T.list();
   eq("board holds exactly the cap", board.length, 20);
   ok("no designer slipped past the cap", board.every((row) => !/Graphic Designer/.test(row.title)));
+  ok("no internship slipped past the scan", board.every((row) => !/intern/i.test(row.title)));
+  ok("no engagement-bait post became a card",
+     board.every((row) => !/Congratulations/.test(row.title)));
   ok("every card carries a rating", board.every((row) => row.match && row.match.pct >= 0 && row.match.pct <= 100));
   ok("every card has 1-5 stars", board.every((row) => row.match.stars >= 1 && row.match.stars <= 5));
   ok("every card is saved", board.every((row) => row.status === "saved"));
-  ok("notes say where it came from", board.every((row) => /Discovered from (LinkedIn|Indeed)/.test(row.notes)));
+  ok("notes say where it came from", board.every((row) => /Discovered from (LinkedIn|Indeed|X)/.test(row.notes)));
   ok("sources labelled", board.every((row) => row.source));
   eq("the skill-rich listing tops the locals",
      Math.max(...board.map((row) => row.match.pct)), 100);
@@ -187,16 +249,16 @@ const { eq, ok, done } = expect("discover");
 
   console.log("--- re-run: no duplicates, leftovers fill the cap ---");
   const second = await D.run({ settings: baseSettings, profile });
-  eq("nothing added twice", second.added, 10);
+  eq("nothing added twice", second.added, 16);
   eq("tracked listings skipped", second.alreadyTracked, 20);
   board = await T.list();
-  eq("board grew by the leftovers only", board.length, 30);
+  eq("board grew by the leftovers only", board.length, 36);
 
   const third = await D.run({ settings: baseSettings, profile });
   eq("third run adds nothing", third.added, 0);
-  eq("everything already tracked", third.alreadyTracked, 30);
+  eq("everything already tracked", third.alreadyTracked, 36);
   ok("says so", third.notes.some((n) => /already on the board/.test(n)));
-  eq("board stable", (await T.list()).length, 30);
+  eq("board stable", (await T.list()).length, 36);
 
   console.log("--- AI shortlist pass ---");
   await T.clear();
@@ -217,7 +279,7 @@ const { eq, ok, done } = expect("discover");
   const nothing = await D.run({ settings: { discoverRoles: [] }, profile: {} });
   eq("not ok", nothing.ok, false);
   ok("explains itself", nothing.notes.some((n) => /No roles/.test(n)));
-  eq("no tabs opened for it", report.tabs, 4);
+  eq("no tabs opened for it", report.tabs, 6);
 
   process.exit(done() ? 1 : 0);
 })();

@@ -5460,6 +5460,214 @@ async function scanJobListings(options) {
 
 
 // ============================================================
+// FEED / HASHTAG POST SCANNER
+// ============================================================
+//
+// The discovery engine's second kind of source: not a job board's search
+// results but the social posts behind a hashtag search — "#hiring", "#ITjobs",
+// "#SDE" on LinkedIn's content search and on X's Latest tab. Recruiters post
+// roles there first, so those posts are worth curating even though many of
+// them also link out to a real posting.
+//
+// A post is not a listing: it is prose with no title/company pair, and its
+// link is as likely to be an internal permalink or a t.co short link as a real
+// apply URL. So the shape built here is:
+//   - url: the best apply target in the post — a direct external (ATS/career)
+//     link when there is one, otherwise the post's own permalink. Short links
+//     (t.co, lnkd.in) are never used: they dedupe badly, and their destination
+//     is unknowable without fetching them.
+//   - title: the first line of the post text with URLs, hashtags and mentions
+//     stripped — enough for the role matcher to score.
+//   - snippet: the post text, which the skill matcher reads like a JD.
+// Returns [{ url, title, company, location, snippet }], deduped by URL. Empty
+// means "nothing recognisable rendered", which on either feed usually means the
+// session was logged out behind an auth wall.
+//
+// These timelines lazy-load, so unlike scanJobListings this one scrolls the
+// page as it polls and stops once two rounds add nothing.
+//
+// IMPORTANT: self-contained, like every function in this file — it is
+// serialized and injected on its own, with no access to the extension's
+// other scripts.
+// ============================================================
+
+async function scanFeedPosts(options) {
+  const opts = options || {};
+  const MAX_POSTS = Math.min(Number(opts.maxCards) || 40, 80);
+  const WAIT_MS = Math.max(Number(opts.waitForMs) || 9000, 0);
+  const POLL_MS = 700;
+  const MAX_SCROLLS = 6;
+  const IDLE_ROUNDS = 2;
+  const wanted = (Array.isArray(opts.hashtags) ? opts.hashtags : [])
+    .map((tag) => String(tag || "").replace(/^#/, "").toLowerCase())
+    .filter(Boolean);
+
+  // A post from a #hiring search still has to read like a job post before it
+  // becomes a card — the feeds return congratulations posts and engagement
+  // bait that happen to sit under the same hashtag.
+  const JOB_RE =
+    /(hiring|recruit|vacanc|job|apply|opening|position|internship|referral|join our|we.?re looking|looking for|now accepting)/i;
+
+  // Shorteners hide the destination, so they are never chosen as the URL.
+  const SHORTLINK = /(^|\.)(t\.co|lnkd\.in|bit\.ly|tinyurl\.com|buff\.ly)$/i;
+  const FEED_HOST = /(^|\.)(x\.com|twitter\.com|linkedin\.com)$/i;
+
+  function textOf(el) {
+    return el && el.textContent ? el.textContent.replace(/\s+/g, " ").trim() : "";
+  }
+
+  function cleanUrl(href) {
+    if (!href) return "";
+    try {
+      const url = new URL(href, location.href);
+      url.hash = "";
+      for (const key of [...url.searchParams.keys()]) {
+        if (/^(utm_|ref|src|trk|tracking)/i.test(key)) url.searchParams.delete(key);
+      }
+      return url.toString();
+    } catch {
+      return "";
+    }
+  }
+
+  function hostOf(href) {
+    try {
+      return new URL(href, location.href).hostname.replace(/^www\./, "").toLowerCase();
+    } catch {
+      return "";
+    }
+  }
+
+  function postText(post) {
+    const el = post.querySelector(
+      '[data-testid="tweetText"], .feed-shared-update-v2__description, ' +
+      ".feed-shared-text, .update-components-text, [class*='update-components-text']"
+    );
+    return el ? textOf(el) : "";
+  }
+
+  // The permalink: the post's own page, used when the post carries no direct
+  // apply URL. The timestamp anchor is the reliable one on both sites.
+  function permalink(post) {
+    const time = post.querySelector("time");
+    const anchors = [];
+    const timeLink = time && time.closest("a[href]");
+    if (timeLink) anchors.push(timeLink);
+    for (const a of post.querySelectorAll("a[href]")) anchors.push(a);
+    for (const a of anchors) {
+      const href = a.getAttribute("href") || "";
+      if (/\/status\/\d+/.test(href)) return cleanUrl(href);
+      if (/\/(posts|pulse)\//.test(href) || /feed\/update/.test(href)) return cleanUrl(href);
+    }
+    return "";
+  }
+
+  // The apply target inside the post, if any: a direct external link, a
+  // LinkedIn job link, or the URL unwrapped from LinkedIn's /redir/redirect
+  // wrapper. Navigation, profile, hashtag and image links are not targets.
+  function jobLink(post) {
+    for (const a of post.querySelectorAll('a[href^="http"]')) {
+      const href = a.getAttribute("href") || "";
+      try {
+        const parsed = new URL(href, location.href);
+        if (/\/redir\//.test(parsed.pathname) && parsed.searchParams.get("url")) {
+          const real = parsed.searchParams.get("url");
+          if (/^https?:/i.test(real)) return cleanUrl(real);
+        }
+      } catch {
+        // Not parseable; fall through to the plain checks below.
+      }
+      if (/linkedin\.com\/jobs\//i.test(href)) return cleanUrl(href);
+      const host = hostOf(href);
+      if (!host || SHORTLINK.test(host) || FEED_HOST.test(host)) continue;
+      if (/\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(href)) continue;
+      return cleanUrl(href);
+    }
+    return "";
+  }
+
+  // The post's first informative sentence, minus the furniture (links,
+  // hashtags, mentions, emoji) — the matcher scores a title-like string.
+  function titleFromText(text) {
+    let value = String(text || "");
+    value = value.replace(/https?:\/\/\S+/g, " ");
+    value = value.replace(/(^|\s)[@#][\w.-]+/g, " ");
+    value = value.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}]/gu, " ");
+    value = value.replace(/\s+/g, " ").trim();
+    if (!value) return "";
+    const firstSentence = value.split(/(?<=[.!?])\s/)[0] || value;
+    let title = (firstSentence.length >= 12 ? firstSentence : value).trim();
+    if (title.length > 140) title = `${title.slice(0, 137).trimEnd()}…`;
+    return title;
+  }
+
+  function posts() {
+    return document.querySelectorAll(
+      'article[data-testid="tweet"], div[data-testid="tweet"], ' +
+      "div.feed-shared-update-v2, article.feed-shared-update-v2, " +
+      "div.occludable-update, article[data-urn]"
+    );
+  }
+
+  // Reads the rendered posts and folds any new ones into `seen`. Newness is
+  // counted by URL so a round that only re-reads the same DOM adds nothing.
+  const seen = new Map();
+  function collect() {
+    for (const post of posts()) {
+      if (seen.size >= MAX_POSTS) break;
+      const text = postText(post);
+      if (!text || text.length < 12) continue;
+
+      const hay = text.toLowerCase();
+      const hasTag = wanted.some((tag) => hay.includes(`#${tag}`));
+      const link = jobLink(post);
+      if (!hasTag && !JOB_RE.test(text) && !link) continue;
+
+      const url = link || permalink(post);
+      if (!url) continue;
+      const existing = seen.get(url);
+      if (existing) {
+        // A later read of the same post may have the fuller text.
+        if (text.length > existing.snippet.length) existing.snippet = text.slice(0, 400);
+        continue;
+      }
+
+      const title = titleFromText(text);
+      if (!title || title.split(" ").length < 2) continue;
+      seen.set(url, {
+        url,
+        title,
+        company: "",
+        location: "",
+        snippet: text.slice(0, 400)
+      });
+    }
+  }
+
+  const deadline = Date.now() + WAIT_MS;
+  let idle = 0;
+  let scrolls = 0;
+  while (Date.now() < deadline && seen.size < MAX_POSTS) {
+    const before = seen.size;
+    collect();
+    if (seen.size >= MAX_POSTS) break;
+    if (seen.size > 0) {
+      if (seen.size === before) idle += 1;
+      else idle = 0;
+      if (idle >= IDLE_ROUNDS) break; // the timeline stopped producing
+    }
+    if (scrolls < MAX_SCROLLS) {
+      window.scrollBy(0, Math.max(600, Math.round(window.innerHeight * 0.9)));
+      scrolls += 1;
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
+
+  return [...seen.values()].slice(0, MAX_POSTS);
+}
+
+
+// ============================================================
 // FILL RESUME BY DROP
 // ============================================================
 //
@@ -6234,4 +6442,216 @@ async function advanceStep(platformConfig = {}, options = {}) {
         ? `Clicked "${matchedLabel}", but the page did not change. It may still be uploading — give it a moment and check before clicking again.`
         : `Clicked "${matchedLabel}", but the page did not move. It may have rejected the step — check the highlighted fields.`
   };
+}
+
+
+// ============================================================
+// COPY FORM DATA TO CLIPBOARD
+// ============================================================
+//
+// Extracts all form fields from the page (including shadow DOM)
+// and copies a structured text representation to the clipboard.
+// This is a helper for debugging/fallback when AI autofill fails.
+//
+// Returns { ok: boolean, count: number, reason?: string }
+// ============================================================
+
+async function copyFormData() {
+  const AUTOFILL_ATTR = "data-autofill-uid";
+
+  // Deep query selector that pierces shadow DOM
+  function querySelectorDeep(selector) {
+    const found = [];
+    const visit = (root) => {
+      for (const el of root.querySelectorAll(selector)) found.push(el);
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  }
+
+  function isVisible(el) {
+    if (!el) return false;
+    if (!el.offsetParent && el.offsetWidth === 0 && el.offsetHeight === 0) {
+      return false;
+    }
+    const style = window.getComputedStyle(el);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }
+
+  function getLabel(el) {
+    // Try aria-label first
+    const ariaLabel = el.getAttribute("aria-label");
+    if (ariaLabel) return ariaLabel.trim();
+
+    // Try name/title/id
+    const name = el.getAttribute("name");
+    if (name) return name.trim();
+
+    const title = el.getAttribute("title");
+    if (title) return title.trim();
+
+    const id = el.getAttribute("id");
+    if (id) {
+      const label = document.querySelector(`label[for="${id}"]`);
+      if (label) {
+        const t = String(label.textContent || "").replace(/\s+/g, " ").trim();
+        if (t) return t;
+      }
+    }
+
+    // Try closest label
+    const wrapper = el.closest("label");
+    if (wrapper) {
+      const t = String(wrapper.textContent || "").replace(/\s+/g, " ").trim();
+      if (t) return t;
+    }
+
+    const placeholder = el.getAttribute("placeholder");
+    if (placeholder) return placeholder.trim();
+
+    const text = el.textContent ? el.textContent.replace(/\s+/g, " ").trim() : "";
+    return text || "unnamed";
+  }
+
+  function getValue(el) {
+    const tag = el.tagName;
+    const type = (el.type || "").toLowerCase();
+
+    if (tag === "INPUT" || tag === "TEXTAREA") {
+      if (type === "checkbox" || type === "radio") {
+        return el.checked ? "true/selected" : "false/unselected";
+      }
+      if (type === "file") {
+        const files = Array.from(el.files || []).map((f) => f.name).join(", ");
+        return files || "(no file selected)";
+      }
+      return el.value || "";
+    }
+
+    if (tag === "SELECT") {
+      if (el.multiple) {
+        return Array.from(el.selectedOptions || [])
+          .map((o) => o.textContent || o.value)
+          .join("; ");
+      }
+      const selected = el.options[el.selectedIndex];
+      if (selected) return selected.textContent || selected.value;
+      return "";
+    }
+
+    // Buttons, links, etc. with role or content
+    if (el.getAttribute("role") === "checkbox") {
+      return el.getAttribute("aria-checked") === "true" ? "true/selected" : "false/unselected";
+    }
+    if (el.getAttribute("role") === "radio") {
+      return el.getAttribute("aria-checked") === "true" ? "true/selected" : "false/unselected";
+    }
+    if (el.getAttribute("aria-haspopup") === "listbox" || el.getAttribute("role") === "combobox") {
+      return el.textContent ? el.textContent.replace(/\s+/g, " ").trim() : (el.value || "");
+    }
+
+    return el.textContent ? el.textContent.replace(/\s+/g, " ").trim() : "";
+  }
+
+  try {
+    const selectors = [
+      "input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=image]):not([type=reset])",
+      "textarea",
+      "select",
+      "[role=checkbox]",
+      "[role=radio]",
+      "button[aria-haspopup=listbox]",
+      "[role=combobox]",
+      "[role=listbox] option",
+      "[role=button][aria-haspopup]",
+    ];
+
+    const allElements = [];
+    for (const sel of selectors) {
+      const elems = querySelectorDeep(sel);
+      allElements.push(...elems);
+    }
+
+    // Deduplicate by element reference
+    const seen = new Set();
+    const uniqueElements = [];
+    for (const el of allElements) {
+      if (!seen.has(el)) {
+        seen.add(el);
+        uniqueElements.push(el);
+      }
+    }
+
+    // Filter visible elements
+    const visibleElements = uniqueElements.filter((el) => isVisible(el));
+
+    // Sort by position in DOM for readability
+    visibleElements.sort((a, b) => {
+      const rectA = a.getBoundingClientRect();
+      const rectB = b.getBoundingClientRect();
+      if (rectA.top !== rectB.top) return rectA.top - rectB.top;
+      return rectA.left - rectB.left;
+    });
+
+    const lines = [];
+    lines.push(`Form data from: ${location.href}`);
+    lines.push(`Page title: ${document.title}`);
+    lines.push(`Extracted at: ${new Date().toISOString()}`);
+    lines.push("---");
+    lines.push("");
+
+    // Also capture form HTML for context
+    const forms = document.querySelectorAll('form');
+    if (forms.length > 0) {
+      lines.push("FORM STRUCTURE (first visible form):");
+      lines.push(forms[0].outerHTML);
+      lines.push("");
+      lines.push("---");
+      lines.push("");
+      lines.push("EXTRACTED FIELD VALUES:");
+      lines.push("");
+    }
+
+    let count = 0;
+    for (const el of visibleElements) {
+      const label = getLabel(el);
+      const value = getValue(el);
+      const tag = el.tagName;
+      const type = el.type ? ` [${el.type}]` : "";
+      lines.push(`Field ${++count}: ${label}${type} (${tag})`);
+      lines.push(`Value: ${value}`);
+      lines.push("");
+    }
+
+    if (count === 0) {
+      lines.push("(No visible form fields found)");
+    }
+
+    const text = lines.join("\n");
+
+    // Try to copy to clipboard
+    try {
+      await navigator.clipboard.writeText(text);
+      return { ok: true, count, text };
+    } catch (err) {
+      // Fallback: create a temporary textarea
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const success = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      if (success) {
+        return { ok: true, count, text };
+      }
+      return { ok: false, count, reason: err.message || "Failed to copy to clipboard" };
+    }
+  } catch (err) {
+    return { ok: false, count: 0, reason: err.message };
+  }
 }

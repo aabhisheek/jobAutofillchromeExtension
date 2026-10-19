@@ -9,6 +9,12 @@
 //    read with chrome.scripting.executeScript, and the tab is closed again.
 //    The tab carries the user's own logged-in session, which is the only way
 //    LinkedIn shows results at all; an anonymous fetch would hit the auth wall.
+//    Two more tabs run the hashtag feeds (settings.discoverHashtags, default
+//    #hiring / #ITjobs / #SDE) on LinkedIn's content search and on X's Latest
+//    tab: recruiters post roles there before or instead of a board listing, so
+//    those posts are read by a different in-page scanner and folded into the
+//    same pool. A post's apply target is the ATS link it carries, falling back
+//    to the post's own permalink.
 // 2. Every listing is scored locally: how well the title matches a wanted
 //    role, and how much of what the posting asks for the profile can actually
 //    answer. That produces the percentage and the stars — deterministic,
@@ -34,6 +40,18 @@ const DISCOVER_AUTO_INTERVAL_MS = 2 * 60 * 60 * 1000;
 // LinkedIn-first, so a long role list spends its budget on the useful site.
 const DISCOVER_MAX_TABS = 4;
 
+// Feed tabs: one hashtag search per social platform, appended after the boards
+// so a run always spends its board budget before it reads posts. Two is the
+// ceiling because there are exactly two feed sources configured, and feeds are
+// the slower, flakier half of a run (login walls, lazy-loading timelines).
+const DISCOVER_MAX_FEED_TABS = 2;
+
+// The hashtags the feed search curates. A recruiter's "#hiring" post is often
+// the only public trace of a role, and these three cover the bulk of
+// early-career tech hiring posts. Overridable from the Discover panel; an
+// explicitly empty list turns the feeds off.
+const DISCOVER_DEFAULT_HASHTAGS = ["hiring", "ITjobs", "SDE"];
+
 // Ceiling on the candidate pool per run. Enough to pick a top 20 with room to
 // spare, small enough that one run stays a handful of seconds.
 const DISCOVER_MAX_POOL = 120;
@@ -41,6 +59,15 @@ const DISCOVER_MAX_POOL = 120;
 const DISCOVER_DEFAULT_MAX_JOBS = 20;
 
 // ---- inputs --------------------------------------------------------------
+
+// An internship-style title. A profile's history usually contains its own
+// "… Intern" role; feeding that back as a target role searches for the exact
+// thing the user is trying to move past, so it is filtered out of the fallback
+// and its postings are skipped, unless the user asks for internships by name.
+// The word boundaries keep "Internal Tools Engineer" out of the net.
+function isInternshipTitle(value) {
+  return /\bintern\b|\binternship\b|\btrainee\b/i.test(String(value || ""));
+}
 
 // The roles to search for. Explicit settings win; an empty list falls back to
 // the profile's own job titles, so discovery works before anyone fills the
@@ -52,13 +79,23 @@ function normalizeDiscoverRoles(settings, profile) {
 
   const history = ((profile && profile.experience) || [])
     .map((entry) => String(entry && entry.title || "").trim())
-    .filter(Boolean);
+    .filter((title) => title && !isInternshipTitle(title));
   return [...new Set(history)].slice(0, 3);
 }
 
+// Early-career, never internships. LinkedIn's experience levels are
+// 1 Internship, 2 Entry level, 3 Associate, 4 Mid-Senior …, so f_E=2,3 is the
+// "0-2 years" band: it drops the Internship level entirely and keeps the two
+// bands a one-year engineer actually competes in. Indeed exposes the same range
+// as explvl=entry_level. Either filter alone still catches a role worded like
+// "Software Engineer" that would otherwise drift back into intern results.
+const LINKEDIN_EXPERIENCE = "2%2C3"; // entry level + associate
+const INDEED_EXPERIENCE = "entry_level";
+
 // Which searches a run performs. Sites are the outer loop so every role gets
 // a LinkedIn search before any role gets a second-board search, and the whole
-// plan is capped at DISCOVER_MAX_TABS.
+// plan is capped at DISCOVER_MAX_TABS. The hashtag feeds are appended last, one
+// per platform.
 function discoverSearchPlan(roles, settings) {
   const where = String((settings && settings.discoverLocations) || "").trim();
   const sites = [
@@ -66,21 +103,76 @@ function discoverSearchPlan(roles, settings) {
       site: "LinkedIn",
       url: (role) =>
         `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(role)}` +
+        `&f_E=${LINKEDIN_EXPERIENCE}` +
         (where ? `&location=${encodeURIComponent(where)}` : "")
     },
     {
       site: "Indeed",
       url: (role) =>
         `https://www.indeed.com/jobs?q=${encodeURIComponent(role)}` +
+        `&explvl=${INDEED_EXPERIENCE}` +
         (where ? `&l=${encodeURIComponent(where)}` : "")
     }
   ];
 
-  const plan = [];
+  const boardPlan = [];
   for (const { site, url } of sites) {
-    for (const role of roles) plan.push({ site, role, url: url(role) });
+    for (const role of roles) boardPlan.push({ site, role, url: url(role) });
   }
-  return plan.slice(0, DISCOVER_MAX_TABS);
+
+  return [
+    ...boardPlan.slice(0, DISCOVER_MAX_TABS),
+    ...discoverFeedPlan(settings).slice(0, DISCOVER_MAX_FEED_TABS)
+  ];
+}
+
+// The hashtags to curate, cleaned to bare words. Accepts the array the panel
+// saves or a comma/space/newline string, drops the leading "#", dedupes
+// case-insensitively and caps the list so a pasted wall of tags cannot turn
+// into a wall of searches. An unset setting means the defaults; an explicitly
+// empty list means "no feeds", which is the switch for turning the feature off.
+function normalizeDiscoverHashtags(settings) {
+  const raw = settings ? settings.discoverHashtags : undefined;
+  if (raw === undefined || raw === null) return [...DISCOVER_DEFAULT_HASHTAGS];
+  const list = Array.isArray(raw) ? raw : String(raw).split(/[\s,]+/);
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    const tag = String(item || "").trim().replace(/^#+/, "").replace(/[^\w.+-]/g, "");
+    if (!tag || seen.has(tag.toLowerCase())) continue;
+    seen.add(tag.toLowerCase());
+    out.push(tag);
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+// One feed tab per platform, searching every hashtag at once with OR. On X the
+// Latest tab (f=live) is the point — Top surfaces stale viral posts, Latest
+// surfaces the posting made this morning. LinkedIn has no Recent/Latest toggle,
+// so its content search (the page a hashtag click lands on) is the equivalent.
+function discoverFeedPlan(settings) {
+  const tags = normalizeDiscoverHashtags(settings);
+  if (!tags.length) return [];
+  const query = tags.map((tag) => `#${tag}`).join(" OR ");
+  return [
+    {
+      site: "LinkedIn Posts",
+      role: "",
+      kind: "feed",
+      hashtags: tags,
+      url:
+        `https://www.linkedin.com/search/results/content/?keywords=${encodeURIComponent(query)}` +
+        `&origin=GLOBAL_SEARCH_HEADER`
+    },
+    {
+      site: "X (Twitter)",
+      role: "",
+      kind: "feed",
+      hashtags: tags,
+      url: `https://x.com/search?q=${encodeURIComponent(query)}&src=typed_query&f=live`
+    }
+  ];
 }
 
 // ---- scoring (pure) ------------------------------------------------------
@@ -183,11 +275,14 @@ async function waitForTabReady(tabId, timeoutMs) {
 }
 
 // One search, one tab: open it in the background, read its cards, close it.
+// Job-board searches read listing cards; hashtag feeds read posts with the
+// feed scanner, which knows a post's apply target is a link inside the prose.
 // Any failure yields [] and the run continues — one board being down is not a
 // reason to return nothing from the other three.
 async function scrapeDiscoverUrl(plan) {
   let tabId = null;
   try {
+    const feed = plan.kind === "feed";
     const tab = await chrome.tabs.create({ url: plan.url, active: false });
     tabId = tab && tab.id;
     if (tabId == null) return [];
@@ -195,8 +290,10 @@ async function scrapeDiscoverUrl(plan) {
 
     const results = await chrome.scripting.executeScript({
       target: { tabId },
-      func: scanJobListings,
-      args: [{ maxCards: 60, waitForMs: 9000 }]
+      func: feed ? scanFeedPosts : scanJobListings,
+      args: [feed
+        ? { maxCards: 40, waitForMs: 9000, hashtags: plan.hashtags || [] }
+        : { maxCards: 60, waitForMs: 9000 }]
     });
     const listings = (results && results[0] && results[0].result) || [];
     return listings
@@ -280,6 +377,14 @@ async function scoreShortlistWithAi(candidates, profile, settings) {
         candidates[index].match.reasons = [...extra, ...candidates[index].match.reasons].slice(0, 5);
       }
     }
+    if (typeof AiEvals !== "undefined") {
+      AiEvals.record({
+        task: "job-scrape",
+        input: { listings: candidates.map((item) => ({ title: String(item.title || "").slice(0, 120), company: String(item.company || "").slice(0, 100) })) },
+        output: { results: candidates.map((item) => ({ title: String(item.title || "").slice(0, 120), shortlist: item.match.shortlist, reasons: (item.match.reasons || []).slice(0, 3) })) },
+        provider: providers[0].id || providers[0].label || ""
+      }).catch(() => {});
+    }
     return scored;
   } catch {
     return 0; // AI is an enhancement; the local scores already stand
@@ -345,6 +450,11 @@ async function runDiscover({ settings, profile, onProgress } = {}) {
     const plan = discoverSearchPlan(roles, settings);
     if (!plan.length) return await fail("Nothing to search.");
 
+    // Only honor internships when the user typed one as a target role. A
+    // professional search never wants the "… Intern" cards a board slips in
+    // beside the real postings.
+    const wantInterns = roles.some(isInternshipTitle);
+
     const maxJobs = Math.max(1, Math.min(50, Number(settings && settings.discoverMaxJobs) || DISCOVER_DEFAULT_MAX_JOBS));
 
     // ---- scrape ----------------------------------------------------------
@@ -355,6 +465,7 @@ async function runDiscover({ settings, profile, onProgress } = {}) {
       report.tabs += 1;
       const listings = await scrapeDiscoverUrl(plan[i]);
       for (const listing of listings) {
+        if (!wantInterns && isInternshipTitle(listing.title)) continue;
         const key = Tracker.normalizeUrl(listing.url) || `${discoverWords(listing.title)}|${discoverWords(listing.company)}`;
         if (!key || seen.has(key)) continue;
         seen.add(key);
@@ -442,8 +553,11 @@ const Discover = {
   STATE_KEY: DISCOVER_STATE_KEY,
   AUTO_INTERVAL_MS: DISCOVER_AUTO_INTERVAL_MS,
   DEFAULT_MAX_JOBS: DISCOVER_DEFAULT_MAX_JOBS,
+  DEFAULT_HASHTAGS: DISCOVER_DEFAULT_HASHTAGS,
   normalizeRoles: normalizeDiscoverRoles,
+  normalizeHashtags: normalizeDiscoverHashtags,
   searchPlan: discoverSearchPlan,
+  feedPlan: discoverFeedPlan,
   roleScore: discoverRoleScore,
   scoreListing: scoreDiscoverListing,
   starsFor: discoverStars,

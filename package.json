@@ -8,7 +8,8 @@
     "test:harness": "node tests/run.js",
     "test:unit": "node --test --test-reporter=spec",
     "test:watch": "node --test --watch",
-    "test:ci": "npm test"
+    "test:ci": "npm test",
+    "server": "node server/index.js"
   },
   "engines": {
     "node": ">=20"

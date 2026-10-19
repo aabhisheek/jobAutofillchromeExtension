@@ -1409,6 +1409,16 @@ function accountStatus(text, kind = "") {
   el.className = `status-msg ${kind}`.trim();
 }
 
+// The email + display name of the extension's own sign-in session
+// (Cloud.getSession, src/lib/cloud.js). Kept tolerant of a missing record so the
+// panel can render a signed-out state without a second code path.
+function accountIdentity(session) {
+  return {
+    email: (session && session.email) || "",
+    name: (session && session.name) || ""
+  };
+}
+
 // Paints the signed-in state from a session record (or null). The panel is
 // entirely a view of that one value, so there is nowhere else to look when
 // asking "is this signed in".
@@ -1420,14 +1430,15 @@ function renderAccountState(session) {
   if (!stateEl) return;
 
   if (session) {
-    const who = session.email || session.name || "Signed in";
+    const identity = accountIdentity(session);
+    const who = identity.email || identity.name || "Signed in";
     stateEl.textContent = `Signed in · ${who}`;
     stateEl.className = "pill on";
     if (signinBtn) signinBtn.classList.add("hidden");
     if (signoutBtn) signoutBtn.classList.remove("hidden");
     if (noteEl) {
-      noteEl.textContent = session.name && session.email
-        ? `Signed in as ${session.name} (${session.email}).`
+      noteEl.textContent = identity.email
+        ? `Signed in as ${identity.email}. Your profile, resume and board sync to Supabase and show on the website.`
         : "Signed in. You can sign out here at any time.";
     }
     return;
@@ -1437,25 +1448,79 @@ function renderAccountState(session) {
   stateEl.className = "pill";
   if (signinBtn) signinBtn.classList.remove("hidden");
   if (signoutBtn) signoutBtn.classList.add("hidden");
-  if (noteEl) noteEl.textContent = "Opens Google's consent screen and asks only for your name and email address.";
+  if (noteEl) {
+    noteEl.textContent = "Sign in with Google — the same account whose data you want on the website.";
+  }
 }
 
 async function initAccountPanel() {
   const panel = byId("account-panel");
   if (!panel) return;
+  if (typeof Cloud === "undefined") {
+    accountStatus("The sign-in client (cloud.js) is not loaded.", "err");
+    return;
+  }
 
-  const settings = await loadPanelSettings();
-  const urlInput = byId("account-api-url");
+  const supabaseUrlInput = byId("account-supabase-url");
+  const supabaseKeyInput = byId("account-supabase-key");
   const signinBtn = byId("account-signin");
   const signoutBtn = byId("account-signout");
 
-  if (urlInput) urlInput.value = settings.cloudApiUrl || "";
+  const initialSettings = await loadPanelSettings();
+  // Left blank when unset: the extension has no bundled project, so an empty box
+  // is the honest "not configured yet" rather than a placeholder that would
+  // silently point the sync at someone else's data.
+  if (supabaseUrlInput) supabaseUrlInput.value = initialSettings.supabaseUrl || "";
+  if (supabaseKeyInput) supabaseKeyInput.value = initialSettings.supabaseAnonKey || "";
   renderAccountState(await Cloud.getSession());
   await renderAccountLastSync();
 
+  // Re-arms the background sync alarm in the service worker. The worker
+  // cannot see a page's storage writes until they land, and the alarm must
+  // follow the session / Supabase config immediately, not on next worker start.
+  function rescheduleBackgroundSync() {
+    try {
+      const result = chrome.runtime.sendMessage({ type: "cloud:reschedule" }, () => {
+        void chrome.runtime.lastError;
+      });
+      // When a callback is supplied Chrome returns nothing, but a mock (or an
+      // older Chrome) may hand back a promise — swallow its rejection so an
+      // unreachable worker never becomes an unhandled rejection.
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    } catch {
+      // Worker not reachable — it reconciles on its next start anyway.
+    }
+  }
+
+  // Shared tail for sign-in: show the state, re-arm the alarm, then run a first
+  // sync immediately so a new device pulls the cloud state down instead of
+  // waiting for the background alarm.
+  async function afterSignIn(session) {
+    renderAccountState(session);
+    rescheduleBackgroundSync();
+    const identity = accountIdentity(session);
+    accountStatus("Signed in — syncing with Supabase…", "busy");
+    const merged = await loadPanelSettings();
+    const res = await (typeof CloudSync !== "undefined" ? CloudSync.pushPull(merged) : { ok: false });
+    if (res && res.ok) {
+      await renderAccountLastSync();
+      accountStatus(`Signed in and synced as ${identity.email || "your account"}.`, "ok");
+      await refresh();
+    } else {
+      accountStatus(
+        `Signed in, but sync failed: ${(res && res.notes && res.notes[0]) || "unknown error"}`,
+        "err"
+      );
+    }
+  }
+
   byId("account-save").addEventListener("click", async () => {
-    const patch = { cloudApiUrl: (urlInput && urlInput.value.trim()) || "" };
+    const patch = {
+      supabaseUrl: (supabaseUrlInput && supabaseUrlInput.value.trim()) || "",
+      supabaseAnonKey: (supabaseKeyInput && supabaseKeyInput.value.trim()) || ""
+    };
     await savePanelSettings(patch);
+    rescheduleBackgroundSync();
     accountStatus("Saved.", "ok");
   });
 
@@ -1464,10 +1529,9 @@ async function initAccountPanel() {
       signinBtn.disabled = true;
       accountStatus("Waiting for Google's consent screen…", "busy");
       try {
-        // Settings are re-read so a server URL typed since page load is used.
+        // Settings are re-read so a URL/key typed since page load is used.
         const session = await Cloud.signIn(await loadPanelSettings());
-        renderAccountState(session);
-        accountStatus(`Signed in as ${session.email || "your account"}.`, "ok");
+        await afterSignIn(session);
       } catch (err) {
         renderAccountState(await Cloud.getSession());
         accountStatus(err.message, "err");
@@ -1483,6 +1547,7 @@ async function initAccountPanel() {
       try {
         await Cloud.signOut(await loadPanelSettings());
         renderAccountState(null);
+        rescheduleBackgroundSync();
         accountStatus("Signed out.", "ok");
       } catch (err) {
         accountStatus(err.message, "err");

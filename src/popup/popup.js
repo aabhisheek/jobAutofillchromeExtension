@@ -150,6 +150,64 @@ async function runAutoScan() {
   await handleScan(reason);
 }
 
+// ---- automatic AI resolve ----
+//
+// After a scan lands fresh rows, whatever the dictionary could not match is
+// resolved with AI on its own — no click, and no per-field prompts. Two things
+// keep this from burning money:
+//
+//   * Only genuinely unmatched, draftable rows are sent (isDraftCandidate:
+//     free text, or a radiogroup the dictionary missed). Matched fields never
+//     leave the machine, and e-mail/phone/date/combobox fields are left alone
+//     because no drafted text could ever be safer than leaving them empty.
+//   * Once per form. resolveFields() already re-asks internally (draft.js:
+//     MAX_REASK_ROUNDS, MAX_RETRIES) and reports only its final answer, so the
+//     expensive part is the batch call itself, not the rounds. The form is
+//     fingerprinted by the field uids a scan stamped, keyed by tab: a rescan
+//     of the same page (queued after a navigation, tab away and back) is
+//     skipped, while a new URL's form or a wizard's next step (different uids)
+//     gets its own resolve. The Resolve button stays as the manual retry.
+//
+// Only runs when AI is on, matching syncResolveButton()'s rule for showing the
+// button — without a configured LLM there is nothing worthwhile to auto-ask.
+const lastAutoResolvedForms = new Map(); // tabId -> uid-sorted form key
+let resolveInFlight = false;
+// A scan finished rendering a different form while a resolve was running; it
+// runs as soon as the current one settles. Only the tab is needed — the form
+// is re-derived from whatever currentRows holds by then.
+let resolveQueued = null;
+
+async function tryAutoResolve(tabId) {
+  if (!currentSettings || !currentSettings.useLLM) return;
+
+  const pending = currentRows.filter(isDraftCandidate);
+  if (!pending.length) return;
+
+  const formKey = currentRows.map((row) => row.uid).sort().join(",");
+  if (lastAutoResolvedForms.get(tabId) === formKey) return;
+
+  if (resolveInFlight) {
+    resolveQueued = tabId;
+    return;
+  }
+
+  // Marked as attempted before the call, win or lose: a form whose resolve
+  // failed must not be re-asked on every rescan all afternoon — that is the
+  // expensive failure mode. Retrying is what the Resolve button is for.
+  resolveInFlight = true;
+  lastAutoResolvedForms.set(tabId, formKey);
+  try {
+    await handleResolveAll(null);
+  } finally {
+    resolveInFlight = false;
+    if (resolveQueued !== null) {
+      const queuedTabId = resolveQueued;
+      resolveQueued = null;
+      tryAutoResolve(queuedTabId);
+    }
+  }
+}
+
 function originPatternFor(url) {
   try {
     const { origin, hostname } = new URL(url);
@@ -439,7 +497,8 @@ function renderRows(rows) {
 
   if (rows.length === 0) {
     list.innerHTML = `<p class="muted">No fillable fields found on this page.</p>`;
-    document.getElementById("fill-bar").classList.add("hidden");
+    const actionTrio = document.getElementById("action-trio");
+  if (actionTrio) actionTrio.classList.add("hidden");
     return;
   }
 
@@ -624,7 +683,8 @@ const draftBtn = document.createElement("button");
     list.appendChild(wrap);
   });
 
-  document.getElementById("fill-bar").classList.remove("hidden");
+  const actionTrio = document.getElementById("action-trio");
+  if (actionTrio) actionTrio.classList.remove("hidden");
 
   // Now that there is a fill bar, work out whether the step can be advanced.
   // Fire-and-forget: renderRows is called from several places, including the
@@ -1295,6 +1355,11 @@ async function performScan(trigger) {
       frames_read: probe && probe.frames ? probe.frames.read : -1,
       frames_loading: probe && probe.frames ? probe.frames.loading : -1
     });
+
+    // Resolve whatever the dictionary could not match, without waiting for a
+    // click. Once per form (see tryAutoResolve), and the resolve itself re-asks
+    // internally — the user reviews the rows it leaves and clicks Fill.
+    tryAutoResolve(tab.id);
   } catch (err) {
     status.textContent = `Could not scan this page: ${err.message}`;
     Analytics.trackTimed("Form Scan Failed", startedAt, { ats: currentAts, trigger, error: err.message });
@@ -1309,7 +1374,12 @@ async function performScan(trigger) {
 // the profile is the bulk of each prompt, so resolving a dozen fields separately
 // re-uploads the same JSON a dozen times. The per-field button stays for
 // retrying one field on its own.
-async function handleResolveAll(buttonEl) {
+//
+// Also the agent for the automatic path: tryAutoResolve() (see the auto-scan
+// wiring) calls this with buttonEl === null after every scan, so nothing waits
+// for the click. Every buttonEl touch is therefore guarded — with no button the
+// status line is the only feedback.
+async function handleResolveAll(buttonEl = null) {
   const status = document.getElementById("scan-status");
   const pending = currentRows.filter(isDraftCandidate);
 
@@ -1319,8 +1389,10 @@ async function handleResolveAll(buttonEl) {
   }
 
   const startedAt = performance.now();
-  buttonEl.disabled = true;
-  buttonEl.textContent = "Resolving…";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Resolving…";
+  }
   status.textContent = `Asking AI about ${pending.length} field${pending.length === 1 ? "" : "s"}…`;
 
   try {
@@ -1334,8 +1406,10 @@ async function handleResolveAll(buttonEl) {
     if (!results.size) {
       status.textContent =
         "AI didn't answer any of these from your profile — nothing was changed. Fill them in by hand, or add detail to your AI context.";
-      buttonEl.disabled = false;
-      buttonEl.textContent = "Resolve All with AI";
+      if (buttonEl) {
+        buttonEl.disabled = false;
+        buttonEl.textContent = "Resolve All with AI";
+      }
       Analytics.trackTimed("Batch Resolve Declined", startedAt, {
         ats: currentAts,
         empty: true,
@@ -1383,6 +1457,19 @@ async function handleResolveAll(buttonEl) {
 
     currentRows = next;
     renderRows(currentRows);
+    // Store an evaluable, value-free trace. Labels and matched profile paths
+    // make a bad mapping reviewable without copying personal answers into an
+    // eval record.
+    AiEvals.record({
+      task: "field-detection",
+      input: { ats: currentAts, fields: pending.map((row) => ({ label: String(row.label || "").slice(0, 140), type: row.type || "" })) },
+      output: { resolved: pending.filter((row) => results.has(row.uid)).map((row) => {
+        const answer = results.get(row.uid);
+        const claim = Array.isArray(sources) ? sources.find((item) => item && item.uid === row.uid) : null;
+        return { label: String(row.label || "").slice(0, 140), kind: answer && answer.values ? "choice" : "text", profilePath: claim && claim.path ? claim.path : "" };
+      }) },
+      provider: source
+    }).catch(() => {});
     // renderRows re-syncs the button, which resets its label and re-enables it.
 
     // A field the dictionary could not name is the one case where an AI answer
@@ -1439,8 +1526,10 @@ async function handleResolveAll(buttonEl) {
     });
   } catch (err) {
     status.textContent = `AI call failed: ${err.message} — nothing was changed.`;
-    buttonEl.disabled = false;
-    buttonEl.textContent = "Resolve All with AI";
+    if (buttonEl) {
+      buttonEl.disabled = false;
+      buttonEl.textContent = "Resolve All with AI";
+    }
     Analytics.trackTimed("Batch Resolve Failed", startedAt, {
       ats: currentAts,
       use_llm: !!currentSettings.useLLM,
@@ -1654,8 +1743,8 @@ async function syncNextButton() {
   const btn = document.getElementById("next-btn");
   if (!btn) return;
 
-  const bar = document.getElementById("fill-bar");
-  if (bar.classList.contains("hidden")) return;
+  const trio = document.getElementById("action-trio");
+  if (trio && trio.classList.contains("hidden")) return;
 
   const warn = document.getElementById("submit-warning");
 
@@ -2111,11 +2200,80 @@ async function handleFill() {
   }
 }
 
+// The compact two-row automation card. Reads the worker's persisted keys and
+// words each row as "last <verb> <exact stamp> · next <relative> (<exact
+// stamp>)" — the exact stamp mirroring the dashboard's mail "Last synced"
+// line. Tolerant of a missing SchedulerState (a cached popup.js newer than the
+// lib must not throw before the autofill UI loads) and of every "never ran
+// yet" shape.
+async function renderAutomationStatus() {
+  if (typeof SchedulerState === "undefined") return;
+
+  const naukriEl = document.getElementById("automation-naukri");
+  const mailEl = document.getElementById("automation-mail");
+  const badgeEl = document.getElementById("automation-badge");
+  if (!naukriEl && !mailEl) return;
+
+  const [naukriState, mailState, status] = await Promise.all([
+    SchedulerState.readNaukriState(),
+    SchedulerState.readEmailLastRun(),
+    SchedulerState.readSchedulerStatus()
+  ]);
+
+  const nextClause = (kind) => {
+    const entry = status[kind];
+    if (!entry || !entry.nextAt) return "";
+    const relative = SchedulerState.formatNextRun(entry.nextAt);
+    const exact = SchedulerState.formatStamp(entry.nextAt);
+    return ` · next ${relative}${exact ? ` (${exact})` : ""}`;
+  };
+
+  if (naukriEl) {
+    const last = naukriState && naukriState.at
+      ? `${naukriState.ok ? "refreshed" : "failed"} ${SchedulerState.formatStamp(naukriState.at)}`
+      : "not refreshed yet";
+    naukriEl.textContent = `${last}${nextClause("naukriRefresh")}`;
+    naukriEl.className = `automation-value ${naukriState && naukriState.at && !naukriState.ok ? "err" : "muted"}`;
+  }
+
+  if (mailEl) {
+    const last = mailState && mailState.at
+      ? `${mailState.ok ? "synced" : "failed"} ${SchedulerState.formatStamp(mailState.at)}`
+      : "not synced yet";
+    mailEl.textContent = `${last}${nextClause("emailSync")}`;
+    mailEl.className = `automation-value ${mailState && mailState.at && !mailState.ok ? "err" : "muted"}`;
+  }
+
+  if (badgeEl) {
+    // Glanceable health dot from the most recent run of either automation.
+    // Blank when neither has run, so "unknown" is not dressed up as "fine".
+    const latest = [naukriState, mailState]
+      .filter((entry) => entry && entry.at)
+      .sort((a, b) => b.at - a.at)[0];
+    badgeEl.textContent = latest ? (latest.ok ? "ok" : "failed") : "";
+    badgeEl.className = `automation-badge${latest ? (latest.ok ? " ok" : " err") : ""}`;
+  }
+}
+
+// The worker writes these keys whenever an alarm arms or fires, so the card
+// stays live if the panel is open across a scheduled run.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes.naukriRefreshState || changes.naukriRefreshHistory || changes.emailSyncHistory || changes.schedulerStatus) {
+    renderAutomationStatus().catch(() => {});
+  }
+});
+
 async function init() {
   Analytics.init("popup");
 
   currentProfile = await loadProfile();
   currentSettings = await loadSettings();
+
+  // Automation status first, and never awaited by the rest of init(): it reads
+  // storage the worker owns, and a slow/absent value must not delay the
+  // autofill review the panel exists for.
+  renderAutomationStatus().catch(() => {});
 
   setupAiContextListeners();
   updateAiContextUI();
@@ -2246,6 +2404,47 @@ document.getElementById("diag-btn").addEventListener("click", async () => {
     status.textContent = `Diagnostics failed: ${err && err.message}`;
   }
 });
+document.getElementById("copy-form-btn").addEventListener("click", async () => {
+  const status = document.getElementById("diag-status");
+  try {
+    const tab = await getActiveTab();
+    if (!tab || !tab.id) {
+      status.textContent = "No active tab found.";
+      return;
+    }
+    const frameList = await readFrames(tab.id);
+    let allText = [];
+    let totalCount = 0;
+    for (const frame of frameList.frames) {
+      try {
+        const result = await injectIntoFrame(tab.id, frame.frameId, copyFormData);
+        if (result && result.ok && result.count > 0) {
+          totalCount += result.count;
+          allText.push(`\n--- Frame ${frame.frameId} (${frame.origin || 'unknown'}) ---\n`);
+          // Get the full text again or reconstruct - easier to just call again but better to store
+          // For now, just add a note
+        }
+      } catch (e) {
+        // Skip inaccessible frames
+      }
+    }
+    // Simpler: call once on top and if needed try others, but better to get combined
+    const result = await injectIntoFrame(tab.id, 0, copyFormData);
+    if (result && result.ok) {
+      // The function already tried to copy to clipboard; if it returned text, we can also copy from popup side as fallback
+      try {
+        await navigator.clipboard.writeText(result.text || '');
+      } catch (e) {
+        // ignore
+      }
+      status.textContent = `Form data copied to clipboard (${result.count} fields found). Paste into ChatGPT/OpenAI.`;
+    } else {
+      status.textContent = result?.reason || "Failed to copy form data.";
+    }
+  } catch (err) {
+    status.textContent = `Copy failed: ${err && err.message}`;
+  }
+});
 function openOptionsFrom(entryPoint) {
   Analytics.track("Options Opened From Popup", { ats: currentAts, entry_point: entryPoint });
   chrome.runtime.openOptionsPage();
@@ -2369,6 +2568,10 @@ trackBtn.addEventListener("click", async () => {
 document.getElementById("footer-dashboard").addEventListener("click", () => {
   Analytics.track("Dashboard Opened From Popup", { ats: currentAts });
   chrome.tabs.create({ url: chrome.runtime.getURL("src/dashboard/dashboard.html") });
+});
+
+document.getElementById("footer-evals").addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("src/evals/evals.html") });
 });
 
 init();

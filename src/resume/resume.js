@@ -47,12 +47,85 @@ async function loadSettings() {
   return settingsReady;
 }
 
+// Identity of a resume PDF for the cached conversion: same name and size means
+// the same bytes for this purpose, so a stored conversion is only ever reused
+// for the file it was read from.
+function pdfSourceKey(name, size) {
+  return `${name}:${size}`;
+}
+
+// The stored conversion of a resume PDF, if one was made from exactly these
+// bytes. chrome.storage.local is the "text file" this writes behind the scenes:
+// an MV3 extension cannot create files inside its own package, so the LaTeX
+// read out of the PDF is kept here and every later run reads it back instead of
+// re-parsing the same PDF.
+async function readCachedPdfTex(pdfKey) {
+  try {
+    const { resumePdfTex } = await chrome.storage.local.get("resumePdfTex");
+    if (resumePdfTex && resumePdfTex.tex && resumePdfTex.pdfKey === pdfKey) {
+      return resumePdfTex;
+    }
+  } catch {
+    // Storage unavailable — treat as a miss; the PDF is converted again below.
+  }
+  return null;
+}
+
+// Best-effort write of a fresh conversion: a full disk must not turn a
+// conversion that already succeeded into a failure, so the LaTeX is used for
+// this run either way.
+async function cachePdfTex(pdfKey, label, tex, extracted) {
+  try {
+    await chrome.storage.local.set({
+      resumePdfTex: {
+        tex,
+        pdfKey,
+        label,
+        stats: extracted.stats,
+        warnings: extracted.warnings,
+        savedAt: Date.now()
+      }
+    });
+  } catch {
+    // ignored — see above
+  }
+}
+
+// PDF in, LaTeX out, through the cache: a hit is returned as-is, a miss is
+// converted once and written back. Returns { ok, text, source } or
+// { ok: false, error }, so the caller can report *why* there is no source
+// instead of only that some other file was missing.
+async function resumeTextFromPdf(pdf) {
+  const pdfKey = pdfSourceKey(pdf.filename || "resume.pdf", pdf.size || 0);
+  const cached = await readCachedPdfTex(pdfKey);
+  if (cached) return { ok: true, text: cached.tex, source: cached.label };
+
+  try {
+    const extracted = await extractPdfToTex(base64ToArrayBuffer(pdf.base64));
+    const tex = (extracted.tex || "").trim();
+    if (!tex) {
+      return { ok: false, error: `no text found in ${pdf.filename} — is it a scanned image?` };
+    }
+    const label = `${pdf.filename} (PDF → LaTeX)`;
+    await cachePdfTex(pdfKey, label, tex, extracted);
+    return { ok: true, text: tex, source: label };
+  } catch (err) {
+    return { ok: false, error: `could not read ${pdf.filename}: ${err.message}` };
+  }
+}
+
 // The LaTeX source to tailor, and where it came from. Resolution order:
 //   1. what this page was given — an uploaded PDF (converted to LaTeX) or a .tex
 //      from the "Use a .tex file instead" box
 //   2. resumeTex already in chrome.storage.local
-//   3. the bundled file named by settings.resumeTexPath (see src/data/settings.json)
-//      — the same single place resumePdfPath lives, so one file configures both.
+//   3. the resume PDF itself — an upload, or settings.resumePdfPath — converted
+//      here (or read back from the conversion stored with it) when nothing
+//      converted it earlier
+//   4. the bundled file named by settings.resumeTexPath (see src/data/settings.json)
+// The PDF sits ahead of the bundled .tex because it is the resume this
+// extension is actually configured with: analysis must keep working off that
+// PDF even when the .tex file has never existed. Only when neither produces
+// anything does this throw, and the message then names everything tried.
 // A PDF is a real source, not just something to attach: it is converted once on
 // upload, and everything downstream works on the resulting LaTeX.
 async function loadResumeText() {
@@ -62,36 +135,46 @@ async function loadResumeText() {
   }
 
   const { resumeTex } = await chrome.storage.local.get("resumeTex");
-  if (resumeTex) return { text: resumeTex, source: "stored resumeTex" };
+  if (resumeTex && resumeTex.trim()) return { text: resumeTex, source: "stored resumeTex" };
 
   const settings = await settingsReady;
-  const resolved = bundledFileUrl(
-    settings.resumeTexPath,
-    "resumeTexPath",
-    [".tex"]
+
+  const pdfResult = await loadResumePdf(settings);
+  let pdfProblem = pdfResult.error;
+  if (pdfResult.pdf && pdfResult.pdf.base64) {
+    const fromPdf = await resumeTextFromPdf(pdfResult.pdf);
+    if (fromPdf.ok) return { text: fromPdf.text, source: fromPdf.source };
+    pdfProblem = fromPdf.error;
+  }
+
+  const resolved = bundledFileUrl(settings.resumeTexPath, "resumeTexPath", [".tex"]);
+  let texProblem = resolved.error;
+  if (!texProblem) {
+    try {
+      const res = await fetch(resolved.url);
+      if (res.ok) {
+        const text = await res.text();
+        if (text.trim()) return { text, source: resolved.path };
+        texProblem = `"${resolved.path}" is empty`;
+      } else {
+        texProblem = `"${resolved.path}" is not in the extension (HTTP ${res.status})`;
+      }
+    } catch {
+      texProblem = `"${resolved.path}" could not be read from the extension`;
+    }
+  }
+
+  // Nothing above produced a resume. Naming only the last file tried would send
+  // the user hunting for a resume.tex that was never the real problem when the
+  // PDF exists but could not be read — so both are reported, plus the one action
+  // that resolves either.
+  const tried = [];
+  if (pdfProblem) tried.push(`resume PDF: ${pdfProblem}`);
+  if (texProblem) tried.push(`LaTeX file: ${texProblem}`);
+  throw new Error(
+    `No resume available — ${tried.join("; ") || "nothing to read"}. ` +
+      "Upload your resume PDF in the box above; it is read and converted to LaTeX automatically."
   );
-
-  if (resolved.error) {
-    throw new Error(resolved.error);
-  }
-
-  // A missing bundled file makes fetch() reject with a bare "Failed to fetch",
-  // which says nothing — name the file and the two ways out.
-  let res;
-  try {
-    res = await fetch(resolved.url);
-  } catch {
-    throw new Error(
-      `"${resolved.path}" is missing from the extension. Restore it (git checkout -- ${resolved.path}) ` +
-        'or upload your resume PDF above (or a .tex in the "Use a .tex file instead" box).'
-    );
-  }
-  if (!res.ok) {
-    throw new Error(
-      `Could not read "${resolved.path}" from the extension (HTTP ${res.status}) — is the file actually there?`
-    );
-  }
-  return { text: await res.text(), source: resolved.path };
 }
 
 // Which file the "current" side is showing, on both the rendered and the source
@@ -247,11 +330,7 @@ async function refreshPreviews() {
 
   const jobs = [
     { id: "old-pages", tex: latestResult.originalText, highlight: "" },
-    {
-      id: "new-pages",
-      tex: latestResult.tailoredText,
-      highlight: latestResult.addedKeywords.length ? ADDED_KEYWORDS_LABEL : ""
-    }
+    { id: "new-pages", tex: latestResult.tailoredText, highlight: "" }
   ];
 
   setPreviewStatus("Rendering pages…");
@@ -283,42 +362,15 @@ async function refreshPreviews() {
   });
 }
 
-// Line-level diff for an additive-only change (tailoring only ever inserts
-// lines, never edits/removes existing ones): find the longest common prefix
-// and suffix by line, everything left in the middle of the new text is the
-// added block.
-function renderDiffPane(paneId, oldText, newText) {
+// A full role rewrite is not an additive change — almost every line differs —
+// so the source pane shows it plainly instead of painting the whole body as
+// "added".
+function renderPlainPane(paneId, text) {
   const pane = document.getElementById(paneId);
   pane.innerHTML = "";
-
-  const oldLines = oldText.split("\n");
-  const newLines = newText.split("\n");
-
-  let prefixLen = 0;
-  while (prefixLen < oldLines.length && prefixLen < newLines.length && oldLines[prefixLen] === newLines[prefixLen]) {
-    prefixLen++;
-  }
-
-  let suffixLen = 0;
-  while (
-    suffixLen < oldLines.length - prefixLen &&
-    suffixLen < newLines.length - prefixLen &&
-    oldLines[oldLines.length - 1 - suffixLen] === newLines[newLines.length - 1 - suffixLen]
-  ) {
-    suffixLen++;
-  }
-
-  const addedStart = prefixLen;
-  const addedEnd = newLines.length - suffixLen;
-
-  newLines.forEach((line, idx) => {
-    const span = document.createElement("span");
-    span.textContent = line + "\n";
-    if (idx >= addedStart && idx < addedEnd) {
-      span.className = "diff-added";
-    }
-    pane.appendChild(span);
-  });
+  const span = document.createElement("span");
+  span.textContent = text;
+  pane.appendChild(span);
 }
 
 async function handleAnalyze() {
@@ -338,24 +390,98 @@ async function handleAnalyze() {
     // A PDF may still be converting into LaTeX in the background; analyzing the
     // bundled .tex instead would quietly compare against the wrong resume.
     await whenSourceReady();
-    const [profile, settings, current] = await Promise.all([loadProfile(), loadSettings(), loadResumeText()]);
-    const result = await buildTailoredResume(current.text, jdText, profile, settings);
+    const [profile, settings, current, contextMd] = await Promise.all([
+      loadProfile(),
+      loadSettings(),
+      loadResumeText(),
+      loadContextMd()
+    ]);
+
+    // Every analysis runs the full role rewrite: the description's role is
+    // detected when it names one (falling back to Full Stack Developer), and the
+    // timeline is rescaled to the years the description asks for (the graduation
+    // year moves with the first job). Matched JD keywords are folded into the
+    // rewritten skills rather than added as a separate keyword line.
+    const detected = detectRoleFromText(jdText);
+    const roleId = detected ? detected.id : "fullstack";
+    const jdKeywords = await extractKeywords(jdText, profile, settings);
+    const { matched, missing } = analyzeMatch(jdKeywords, profile);
+    // Scale the timeline up to what the description asks for; never shrink real
+    // experience to match a lower number (a "1+ year" posting must not cut a
+    // 3-year resume down to 1).
+    const requiredYears = detectRequiredYears(jdText);
+    const currentMonths = estimateExperienceMonths(profile.experience);
+    const targetYears = requiredYears && requiredYears * 12 > currentMonths ? requiredYears : null;
+
+    const rewrite = await rewriteForRole({
+      profile,
+      contextMd,
+      roleId,
+      customRole: "",
+      targetYears,
+      jdText,
+      extraSkills: matched,
+      settings
+    });
+    const result = {
+      originalText: current.text,
+      tailoredText: rewrite.tex,
+      jdKeywords,
+      matched,
+      missing,
+      addedKeywords: rewrite.tailored.skillsFocusAdded || [],
+      newKeywords: [],
+      roleLabel: rewrite.playbook.label,
+      yearsLabel: rewrite.tailored.yearsLabel,
+      dateShifted: !!rewrite.dateResult.shifted
+    };
+
+    // Never silently replace a good resume with one that failed validation —
+    // keep the previous result and surface the reason instead.
+    if (!rewrite.validation.ok && latestResult && latestResult.validationOk !== false) {
+      document.getElementById("results").classList.remove("hidden");
+      status.textContent = `Rewrite failed validation (${rewrite.validation.errors.join("; ")}) — keeping the previous result.`;
+      Analytics.trackTimed("Resume Rewrite Validation Failed", startedAt, {
+        error_count: rewrite.validation.errors.length,
+        kept_previous: true
+      });
+      return;
+    }
+    result.validationOk = rewrite.validation.ok;
     latestResult = result;
 
     renderChips("matched-chips", result.matched, "matched");
     renderChips("missing-chips", result.missing, "missing");
 
     document.getElementById("old-pane").textContent = result.originalText;
-    renderDiffPane("new-pane", result.originalText, result.tailoredText);
+    // A role rewrite is not an additive change — almost every line differs — so
+    // the source pane is shown plainly instead of painted as one added block.
+    renderPlainPane("new-pane", result.tailoredText);
     renderCurrentSourceLabels(current.source);
     // Carried into the print job so "Save as PDF" names the file after the
     // resume it came from, not after this page.
-    latestResult.sourceLabel = current.source;
+    latestResult.sourceLabel = `role rewrite — ${result.roleLabel} (from ${current.source})`;
 
-    const addedNote = result.addedKeywords.length
-      ? `Added ${result.addedKeywords.length} keyword(s) not already in the resume text.`
-      : "All matched keywords were already present in the resume text — nothing added.";
-    status.textContent = `${result.matched.length} matched, ${result.missing.length} gap(s). ${addedNote}`;
+    // Say exactly what changed: which role it was rewritten for, which JD
+    // keywords were folded into the skills, and which were deliberately left
+    // out because nothing in the profile backs them.
+    const parts = [];
+    parts.push(
+      `Rewritten for ${result.roleLabel}` +
+        (result.dateShifted ? ` with the timeline rescaled to ${result.yearsLabel}` : "")
+    );
+    if (result.addedKeywords.length) {
+      parts.push(`surfaced ${result.addedKeywords.length} matched keyword(s) in the skills`);
+    } else if (result.matched.length) {
+      parts.push(`${result.matched.length} JD keyword(s) already covered by the skills`);
+    } else {
+      parts.push("no JD keyword matches your profile");
+    }
+    if (result.missing.length) parts.push(`${result.missing.length} JD keyword(s) left out (no match in your profile)`);
+    if (!rewrite.validation.ok) {
+      parts.unshift(`Validation warning: ${rewrite.validation.errors.join("; ")}`);
+    }
+    status.textContent = `${parts.join(". ")}.`;
 
     document.getElementById("results").classList.remove("hidden");
     // After the results are on screen, not before: the preview measures its own
@@ -374,6 +500,8 @@ async function handleAnalyze() {
       matched_count: result.matched.length,
       missing_count: result.missing.length,
       added_count: result.addedKeywords.length,
+      role_rewrite: true,
+      target_years: targetYears || "kept",
       use_llm: !!settings.useLLM
     });
   } catch (err) {
@@ -410,6 +538,207 @@ document.getElementById("download-btn").addEventListener("click", () => {
 });
 
 document.getElementById("analyze-btn").addEventListener("click", handleAnalyze);
+
+// ---- Role-based rewrite ---------------------------------------------------
+// Rewrites the whole resume for a target role (headline, titles, bullets,
+// projects, skills) and optionally rescales the employment timeline to a target
+// number of years. See src/lib/resume-rewriter.js for the playbooks and the
+// date engine. Nothing is written to storage — the result lives in
+// latestResult like a keyword-tailored run, and is exported the same ways.
+
+const CONTEXT_MD_URL = chrome.runtime.getURL("src/data/context.md");
+
+async function loadContextMd() {
+  try {
+    const res = await fetch(CONTEXT_MD_URL);
+    return res.ok ? await res.text() : "";
+  } catch {
+    return "";
+  }
+}
+
+// Remembered choices so reopening the page for the next application doesn't
+// start from scratch. { roleId, customRole, years, polish }.
+let rewritePrefs = { roleId: "java-developer", customRole: "", years: "", polish: false };
+// Set when the user touches a control, so JD-based auto-detection (which runs
+// when the popup hands over a scraped description) never overrides a choice
+// made in this tab.
+let rewritePrefsTouched = false;
+
+async function loadRewritePrefs() {
+  try {
+    const stored = (await chrome.storage.local.get("rewritePrefs")).rewritePrefs;
+    if (stored && typeof stored === "object") rewritePrefs = { ...rewritePrefs, ...stored };
+  } catch {
+    // defaults are fine
+  }
+  document.getElementById("role-select").value = rewritePrefs.roleId || "java-developer";
+  document.getElementById("role-custom-input").value = rewritePrefs.customRole || "";
+  document.getElementById("years-select").value = rewritePrefs.years || "";
+  document.getElementById("polish-checkbox").checked = !!rewritePrefs.polish;
+  toggleCustomRoleInput();
+}
+
+function persistRewritePrefs() {
+  rewritePrefs = {
+    roleId: document.getElementById("role-select").value,
+    customRole: document.getElementById("role-custom-input").value.trim(),
+    years: document.getElementById("years-select").value,
+    polish: document.getElementById("polish-checkbox").checked
+  };
+  chrome.storage.local.set({ rewritePrefs });
+}
+
+function toggleCustomRoleInput() {
+  const isCustom = document.getElementById("role-select").value === "custom";
+  document.getElementById("role-custom-input").classList.toggle("hidden", !isCustom);
+}
+
+["role-select", "role-custom-input", "years-select", "polish-checkbox"].forEach((id) => {
+  document.getElementById(id).addEventListener("change", () => {
+    rewritePrefsTouched = true;
+    toggleCustomRoleInput();
+    persistRewritePrefs();
+  });
+});
+
+async function handleRewrite() {
+  const status = document.getElementById("rewrite-status");
+  const roleSelect = document.getElementById("role-select");
+  const roleId = roleSelect.value;
+  const customRole = document.getElementById("role-custom-input").value.trim();
+  const yearsValue = document.getElementById("years-select").value;
+  const polish = document.getElementById("polish-checkbox").checked;
+  const jdText = document.getElementById("jd-input").value.trim();
+
+  if (roleId === "custom" && !customRole) {
+    status.textContent = "Type the custom role title first.";
+    return;
+  }
+
+  const startedAt = performance.now();
+  status.textContent = "Rewriting…";
+  document.getElementById("results").classList.add("hidden");
+  const rewriteBtn = document.getElementById("rewrite-btn");
+  rewriteBtn.disabled = true;
+
+  try {
+    await whenSourceReady();
+    const [profile, settings, contextMd] = await Promise.all([
+      loadProfile(),
+      loadSettings(),
+      loadContextMd()
+    ]);
+
+    // The rewrite is generated fresh from profile.json + context.md, so an
+    // unconfigured resume source is not fatal — it only costs us the "old"
+    // side of the diff. Fall back to an empty original rather than failing.
+    let current = { text: "", source: "profile.json (no resume source configured)" };
+    try {
+      current = await loadResumeText();
+    } catch (err) {
+      setPreviewStatus(`No current resume source: ${err.message} — showing the rewrite only.`);
+    }
+
+    // Match the JD's keywords first, then hand the matches to the rewrite so
+    // they are folded into the skills rather than added as a keyword line.
+    let jdKeywords = [];
+    let matched = [];
+    let missing = [];
+    if (jdText) {
+      jdKeywords = await extractKeywords(jdText, profile, settings);
+      const analysis = analyzeMatch(jdKeywords, profile);
+      matched = analysis.matched;
+      missing = analysis.missing;
+    }
+
+    const result = await rewriteForRole({
+      profile,
+      contextMd,
+      roleId,
+      customRole,
+      targetYears: yearsValue ? Number(yearsValue) : null,
+      jdText,
+      extraSkills: matched,
+      settings: { ...settings, rewritePolish: polish }
+    });
+
+    const tailoredText = result.tex;
+    const addedKeywords = result.tailored.skillsFocusAdded || [];
+
+    // Never silently replace a good resume with one that failed validation.
+    if (!result.validation.ok && latestResult && latestResult.validationOk !== false) {
+      document.getElementById("results").classList.remove("hidden");
+      status.textContent = `Rewrite failed validation (${result.validation.errors.join("; ")}) — keeping the previous result.`;
+      Analytics.trackTimed("Resume Rewrite Validation Failed", startedAt, {
+        error_count: result.validation.errors.length,
+        kept_previous: true
+      });
+      return;
+    }
+
+    latestResult = {
+      originalText: current.text,
+      tailoredText,
+      jdKeywords,
+      matched,
+      missing,
+      addedKeywords,
+      validationOk: result.validation.ok,
+      sourceLabel: `role rewrite — ${result.playbook.label}${yearsValue ? `, ${yearsValue} yrs` : ""} (from ${current.source})`
+    };
+
+    renderChips("matched-chips", matched, "matched");
+    renderChips("missing-chips", missing, "missing");
+    document.getElementById("old-pane").textContent = current.text;
+    renderPlainPane("new-pane", tailoredText);
+    renderCurrentSourceLabels(current.source);
+
+    const dateNote = result.dateResult.shifted
+      ? `Timeline rescaled to ${result.tailored.yearsLabel} (shifted ${result.dateResult.deltaMonths} month(s) vs. today-anchored span).`
+      : `Dates kept as-is (${result.tailored.yearsLabel} total).`;
+    const polishNote = result.polishedWith ? ` Wording polished with ${result.polishedWith}.` : "";
+    const keywordNote = jdText
+      ? addedKeywords.length
+        ? ` ${addedKeywords.length} JD keyword(s) folded into the skills.`
+        : matched.length
+          ? ` ${matched.length} JD keyword(s) already covered by the skills.`
+          : " No JD keyword matched your profile — see the gaps below."
+      : "";
+    status.textContent = `Rewritten for ${result.playbook.label}. ${dateNote}${polishNote}${keywordNote}`;
+    if (!result.validation.ok) {
+      status.textContent = `Validation warning: ${result.validation.errors.join("; ")}. ${status.textContent}`;
+    }
+
+    document.getElementById("results").classList.remove("hidden");
+    try {
+      await refreshPreviews();
+    } catch (err) {
+      setPreviewStatus(`Preview failed: ${err.message} — the LaTeX source view still works.`);
+    }
+
+    Analytics.trackTimed("Resume Rewritten", startedAt, {
+      role: result.playbook.id,
+      years: yearsValue || "kept",
+      shifted: !!result.dateResult.shifted,
+      polished: !!result.polishedWith,
+      jd_present: !!jdText,
+      matched_count: matched.length
+    });
+  } catch (err) {
+    status.textContent = `Could not rewrite: ${err.message}`;
+    Analytics.trackTimed("Resume Rewrite Failed", startedAt, {
+      role: roleId,
+      years: yearsValue || "kept",
+      error: err.message
+    });
+  } finally {
+    rewriteBtn.disabled = false;
+  }
+}
+
+document.getElementById("rewrite-btn").addEventListener("click", handleRewrite);
+loadRewritePrefs();
 
 // ---- Resume source: an uploaded PDF, or a .tex ---------------------------
 // Scratch source only: it lives in memory for this tab, is named in the pane
@@ -512,12 +841,11 @@ document.getElementById("print-btn").addEventListener("click", async () => {
   const saveStatus = document.getElementById("save-status");
   if (!latestResult) return;
 
-  const addedLine = latestResult.addedKeywords.length ? ADDED_KEYWORDS_LABEL : "";
   await chrome.storage.session.set({
     resumePrintJob: {
       tex: latestResult.tailoredText,
       engine: selectedEngine(),
-      highlightText: addedLine,
+      highlightText: "",
       label: latestResult.sourceLabel || "resume",
       at: Date.now()
     }
@@ -549,6 +877,19 @@ document.getElementById("print-btn").addEventListener("click", async () => {
   const jdInput = document.getElementById("jd-input");
   const status = document.getElementById("status");
   jdInput.value = pendingJD.text;
+
+  // Preselect the role this job description looks like — the rewrite half of
+  // the page answers to the same JD the keyword half just received. A choice
+  // already made in this tab always wins over detection.
+  await loadRewritePrefs();
+  if (!rewritePrefsTouched) {
+    const detected = detectRoleFromText(pendingJD.text);
+    if (detected && detected.score >= 3) {
+      document.getElementById("role-select").value = detected.id;
+      toggleCustomRoleInput();
+      persistRewritePrefs();
+    }
+  }
 
   const ageMs = Date.now() - (pendingJD.capturedAt || 0);
   const staleNote = ageMs > 5 * 60 * 1000 ? " (captured a few minutes ago — re-check it's still the right posting)" : "";
@@ -584,7 +925,8 @@ function renderPdfStatus(result) {
 
 // Reads an uploaded PDF into LaTeX and makes it the tailoring source. The text
 // and structure come back out of the PDF (pdf.js), so the rest of the page —
-// preview, tailoring, print — works exactly as it does for a .tex.
+// preview, tailoring, print — works exactly as it does for a .tex. The
+// conversion is kept (see readCachedPdfTex) so these bytes are only parsed once.
 async function usePdfAsResumeSource(file, options) {
   const opts = options || {};
   const status = document.getElementById("pdf-source-status");
@@ -596,6 +938,30 @@ async function usePdfAsResumeSource(file, options) {
   // different file while it runs must win, not lose to the older result.
   const seq = ++pdfConvertSeq;
   const startedAt = performance.now();
+  const pdfKey = pdfSourceKey(file.name, file.size);
+
+  // Already converted from exactly these bytes — reuse that instead of parsing
+  // the whole PDF again on every open of this page.
+  const cached = await readCachedPdfTex(pdfKey);
+  if (seq !== pdfConvertSeq) return;
+  if (cached) {
+    const stats = cached.stats;
+    setOverrideSource(
+      "pdf",
+      cached.tex,
+      cached.label,
+      stats
+        ? `Read ${stats.pages} page(s), ${stats.lines} lines, ${stats.sections} sections, ${stats.bullets} bullets ` +
+            `from ${file.name} (saved conversion) — press Analyze & Tailor.`
+        : `Using ${file.name} (saved conversion) — press Analyze & Tailor.`
+    );
+    if (cached.warnings && cached.warnings.length) {
+      status.textContent += ` Note: ${cached.warnings.join(" ")}`;
+    }
+    Analytics.track("Resume PDF Converted", { cached: true, auto: !!opts.quiet });
+    return;
+  }
+
   try {
     const buffer = await file.arrayBuffer();
     const extracted = await extractPdfToTex(buffer);
@@ -618,6 +984,7 @@ async function usePdfAsResumeSource(file, options) {
     // Warnings are about this PDF, so they belong next to it rather than in the
     // analysis status line, which is about the job description.
     if (warnings.length) status.textContent += ` Note: ${warnings.join(" ")}`;
+    await cachePdfTex(pdfKey, label, extracted.tex, extracted);
     Analytics.trackTimed("Resume PDF Converted", startedAt, {
       pages: stats.pages,
       lines: stats.lines,

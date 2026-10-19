@@ -32,10 +32,26 @@
   ],
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*"],
-      "js": ["src/content/autodetect.js"],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "src/content/autodetect.js"
+      ],
       "run_at": "document_idle",
       "all_frames": true
+    },
+    {
+      "matches": [
+        "*://*.naukri.com/*",
+        "*://*.naukri.in/*",
+        "*://login.naukri.com/*"
+      ],
+      "js": [
+        "src/content/naukri-profile.js"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "background": {

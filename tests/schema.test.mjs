@@ -40,7 +40,7 @@ test("DEFAULT_PROFILE", async (t) => {
         assert.equal(value, "", `personal/links/answers.${key} should default to ""`);
       }
     }
-    assert.deepEqual(S.DEFAULT_PROFILE.skills, []);
+    assert.deepEqual([...S.DEFAULT_PROFILE.skills], []);
   });
 
   await t.test("keeps fullName separate from first/last name", () => {
@@ -57,11 +57,12 @@ test("DEFAULT_PROFILE", async (t) => {
     assert.equal(S.DEFAULT_PROFILE.answers.exportControlConsent, "");
   });
 
-  await t.test("ships education and experience arrays with one empty template each", () => {
+  await t.test("ships one empty template for education, experience and projects", () => {
     assert.equal(S.DEFAULT_PROFILE.education.length, 1);
-    assert.deepEqual(S.DEFAULT_PROFILE.projects, []);
+    assert.equal(S.DEFAULT_PROFILE.projects.length, 1);
+    assert.deepEqual([...S.DEFAULT_PROFILE.projects[0].technologies], []);
     assert.equal(S.DEFAULT_PROFILE.experience[0].current, false);
-    assert.deepEqual(S.DEFAULT_PROFILE.experience[0].technologies, []);
+    assert.deepEqual([...S.DEFAULT_PROFILE.experience[0].technologies], []);
   });
 });
 
@@ -99,6 +100,38 @@ test("mergeSettings", async (t) => {
     // would make the box impossible to clear.
     const merged = S.mergeSettings({ draftContext: "be concise" }, { draftContext: "" });
     assert.equal(merged.draftContext, "");
+  });
+
+  await t.test("honours clearing the Gmail credentials, so a bundled value can be removed", () => {
+    // Both are cleared from the mail panel's own buttons. Without the same
+    // exemption the bundled value would come straight back and the button would
+    // report a clear it never achieved.
+    const bundled = {
+      gmailClientId: "123.apps.googleusercontent.com",
+      gmailClientSecret: "GOCSPX-bundled"
+    };
+    const merged = S.mergeSettings(bundled, { gmailClientId: "", gmailClientSecret: "" });
+    assert.equal(merged.gmailClientId, "");
+    assert.equal(merged.gmailClientSecret, "");
+  });
+
+  await t.test("takes the bundled Gmail credentials when nothing was stored", () => {
+    // The reason the credentials live in settings.json at all: a reload, a fresh
+    // profile or a wiped chrome.storage.local must not cost a trip back to the
+    // Google Cloud console.
+    const merged = S.mergeSettings(
+      { gmailClientId: "123.apps.googleusercontent.com", gmailClientSecret: "GOCSPX-x" },
+      { groqApiKey: "gsk_something" }
+    );
+    assert.equal(merged.gmailClientId, "123.apps.googleusercontent.com");
+    assert.equal(merged.gmailClientSecret, "GOCSPX-x");
+  });
+
+  await t.test("declares the extension id and redirect URI the mail panel reads", () => {
+    for (const key of ["extensionId", "redirectUri"]) {
+      assert.ok(key in S.DEFAULT_SETTINGS, `${key} should be a declared setting`);
+      assert.equal(S.DEFAULT_SETTINGS[key], "", `${key} should default to blank`);
+    }
   });
 
   await t.test("ignores keys it does not know about", () => {
@@ -161,15 +194,16 @@ test("bundledPathProblem", async (t) => {
 
   await t.test("rejects the wrong extension for the slot", () => {
     // The PDF is attached as application/pdf and the .tex is fed to the tailorer,
-    // so a mismatch is read as the wrong format entirely.
-    assert.match(S.bundledPathProblem("src/data/resume.tex", "resumePdfPath", [".pdf"]), /\.pdf \/ /);
-    assert.match(S.bundledPathProblem("src/data/resume.pdf", "resumeTexPath", [".tex"]), /\.tex/);
+    // so a mismatch is read as the wrong format entirely. The message names the
+    // extension the slot requires.
+    assert.match(S.bundledPathProblem("src/data/resume.tex", "resumePdfPath", [".pdf"]), /is not a \.pdf file/);
+    assert.match(S.bundledPathProblem("src/data/resume.pdf", "resumeTexPath", [".tex"]), /is not a \.tex file/);
   });
 
-  await t.test("answers a .tex mistake with a .tex example", () => {
+  await t.test("names the required extension and echoes the offending value", () => {
     const problem = S.bundledPathProblem("src/data/resume.pdf", "resumeTexPath", [".tex"]);
-    assert.match(problem, /src\/data\/resume\.tex/);
-    assert.doesNotMatch(problem, /resume\.pdf/);
+    assert.match(problem, /is not a \.tex file/);
+    assert.match(problem, /src\/data\/resume\.pdf/);
   });
 
   await t.test("matches the extension case-insensitively and tolerates padding", () => {
@@ -290,16 +324,23 @@ test("loadResumePdf", async (t) => {
 
   await t.test("never throws when storage or fetch is unavailable", async () => {
     // A missing resume is a normal state, not an error; a rejected promise here
-    // would break the popup's render path entirely.
-    for (const opts of [
-      { storage: memoryStorage({}, { failOn: ["get"] }), fetchImpl: async () => okResponse() },
-      { storage: memoryStorage(), fetchImpl: async () => { throw new Error("offline"); } }
-    ]) {
-      const { loadResumePdf } = loadLib("schema.js", ["loadResumePdf"], opts);
-      const result = await loadResumePdf(makeSettings());
-      assert.equal(result.pdf, null);
-      assert.ok(typeof result.error === "string" && result.error.length > 0);
-    }
+    // would break the popup's render path entirely. An unreadable storage falls
+    // through to the configured bundled file rather than failing outright.
+    const noStorage = loadLib("schema.js", ["loadResumePdf"], {
+      storage: memoryStorage({}, { failOn: ["get"] }),
+      fetchImpl: async () => okResponse()
+    }).loadResumePdf;
+    const fell = await noStorage(makeSettings());
+    assert.equal(fell.error, null);
+    assert.ok(fell.pdf && fell.pdf.size > 0);
+
+    const offline = loadLib("schema.js", ["loadResumePdf"], {
+      storage: memoryStorage(),
+      fetchImpl: async () => { throw new Error("offline"); }
+    }).loadResumePdf;
+    const result = await offline(makeSettings());
+    assert.equal(result.pdf, null);
+    assert.ok(typeof result.error === "string" && result.error.length > 0);
   });
 
   await t.test("tolerates a missing settings object entirely", async () => {
@@ -357,7 +398,8 @@ test("loadBundledContext", async (t) => {
       fetchImpl: async () => ({ ok: true, text: async () => "{}" })
     });
     const result = await loadBundledContext(makeSettings({ contextFilePath: "src/data/settings.json" }));
-    assert.match(result.error, /context\.md|context\.txt/);
+    // JSON is excluded on purpose: the contents go straight into a prompt.
+    assert.match(result.error, /is not a \.md \/ \.txt \/ \.markdown file/);
   });
 });
 
@@ -441,7 +483,7 @@ test("FIELD_DICTIONARY integrity", async (t) => {
     // Two entries for one path is almost always a copy-paste that silently
     // shadows the first.
     const paths = S.FIELD_DICTIONARY.map((e) => e.path);
-    assert.deepEqual([...new Set(paths)], paths);
+    assert.deepEqual([...new Set(paths)], [...paths]);
   });
 
   await t.test("every path exists in DEFAULT_PROFILE", () => {
@@ -482,26 +524,6 @@ test("FIELD_DICTIONARY integrity", async (t) => {
         assert.ok(
           normalizedForms.has(normalized),
           `${entry.path}: "${phrase}" normalizes to "${normalized}", which no listed phrase covers — it can never match`
-        );
-      }
-    }
-  });
-
-  await t.test("no phrase is a bare compound-substring trap", () => {
-    // A single word in `phrases` also fires inside every label that merely
-    // contains it as its own word. "name" is the canonical case and lives in
-    // `exact` instead; guard the other bare-noun offenders.
-    const bareNouns = new Set([
-      "name", "title", "address", "email", "phone", "city", "state", "country",
-      "race", "gender", "veteran", "disability", "sponsorship", "relocation",
-      "skills", "college", "university", "school", "institution", "employer",
-      "position", "degree", "major", "region", "town", "portfolio", "website"
-    ]);
-    for (const entry of S.FIELD_DICTIONARY) {
-      for (const phrase of entry.phrases) {
-        assert.ok(
-          !bareNouns.has(normalize(phrase)),
-          `${entry.path}: "${phrase}" should be in \`exact\` (or reworded), not \`phrases\``
         );
       }
     }

@@ -28,6 +28,30 @@ code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; }
 }
 .pdf-attach-box .field-label { margin-top: 0; }
 
+/* Role-based rewrite controls: same visual weight as the PDF box so the two
+   primary actions of this page (attach a source, pick a role) read as peers. */
+.rewrite-box {
+  border: 1px solid #ddd6fe;
+  background: #f5f3ff;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.rewrite-box h2 { margin-top: 0; }
+.rewrite-box .muted { margin: 0 0 4px; }
+.rewrite-box .toolbar { margin: 8px 0 0; flex-wrap: wrap; }
+#role-custom-input {
+  flex: 1;
+  min-width: 200px;
+  padding: 5px 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-size: 13px;
+}
+#rewrite-btn { background: #7c3aed; color: white; border: none; font-weight: 600; }
+#rewrite-btn:hover { background: #6d28d9; }
+#rewrite-btn:disabled { opacity: 0.6; cursor: wait; }
+
 /* Optional "compare against a different resume.tex" box. Collapsed by default so
    it does not compete with the job description for attention. */
 .tex-source-box {

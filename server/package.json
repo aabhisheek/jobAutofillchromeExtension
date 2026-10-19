@@ -1,0 +1,14 @@
+{
+  "name": "job-autofill-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Google sign-in and session backend for the Job Application Autofill extension.",
+  "type": "commonjs",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}

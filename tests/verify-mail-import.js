@@ -105,10 +105,30 @@ eq("prose prefix", MailImport.parseJsonObject('Here you go:\n{"title":"X"}'), { 
 eq("brace in prose", MailImport.parseJsonObject('Use a { brace } carefully. Result: {"title":"Y"}'), { title: "Y" });
 eq("garbage", MailImport.parseJsonObject("no json here"), null);
 
+console.log("--- parseJsonArray ---");
+eq("plain array", MailImport.parseJsonArray('[{"ref":"e1","title":"X"}]'), [{ ref: "e1", title: "X" }]);
+eq("fenced", MailImport.parseJsonArray('```json\n[{"ref":"e2"}]\n```'), [{ ref: "e2" }]);
+eq("prose prefix", MailImport.parseJsonArray('Here you go:\n[{"ref":"e3"}]'), [{ ref: "e3" }]);
+eq("bracket in prose", MailImport.parseJsonArray('See [1] above. Result: [{"ref":"e4"}]'), [{ ref: "e4" }]);
+eq("nested brackets survive", MailImport.parseJsonArray('[{"ref":"e5","tags":["a","b"]}]'), [{ ref: "e5", tags: ["a", "b"] }]);
+eq("an object is not an array", MailImport.parseJsonArray('{"ref":"e1"}'), null);
+eq("garbage", MailImport.parseJsonArray("no array here"), null);
+
 console.log("--- buildQuery ---");
 eq("appends floor", MailImport.buildQuery({ emailSyncQuery: '"application received"', emailLookbackDays: 14 }), '"application received" newer_than:14d');
 eq("respects user's own", MailImport.buildQuery({ emailSyncQuery: 'newer_than:7d "x"', emailLookbackDays: 30 }), 'newer_than:7d "x"');
 eq("empty query", MailImport.buildQuery({ emailSyncQuery: "", emailLookbackDays: 30 }), "newer_than:30d");
+
+console.log("--- buildWindowQuery (full read) ---");
+eq("window is the look-back floor alone", MailImport.buildWindowQuery({ emailLookbackDays: 90 }), "newer_than:90d");
+eq("no search terms in the window", MailImport.buildWindowQuery({ emailSyncQuery: '"application received"', emailLookbackDays: 30 }), "newer_than:30d");
+
+console.log("--- looksLikeApplicationMail (full read gate) ---");
+eq("outcome mail passes", MailImport.looksLikeApplicationMail({ subject: "Interview invitation - Backend at Acme" }), true);
+eq("confirmation subject passes", MailImport.looksLikeApplicationMail({ subject: "Your application for Data Engineer at Globex" }), true);
+eq("ATS sender passes", MailImport.looksLikeApplicationMail({ subject: "Update", from: { domain: "greenhouse.io" } }), true);
+eq("newsletter with no signal is turned away", MailImport.looksLikeApplicationMail({ subject: "10 productivity tips for this week", from: { domain: "digest.example.com" }, snippet: "Read more." }), false);
+eq("job-feed alert from a board is turned away", MailImport.looksLikeApplicationMail({ subject: "New jobs for you", from: { domain: "linkedin.com" } }), false);
 
 console.log("--- tracker upsert / dedupe ---");
 (async () => {

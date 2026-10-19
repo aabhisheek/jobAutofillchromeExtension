@@ -297,6 +297,18 @@
   color: var(--text-subtle);
 }
 
+/* Dedicated, always-visible AI tally for the mail sync. The transient status
+   line is easy to miss during a run, so the counts live in their own row that
+   updates on every progress tick and stays put afterwards. */
+.ai-stats {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-muted);
+}
+.ai-stats.warn { color: var(--danger, #b91c1c); }
+
 .step-title {
   margin: 0 0 8px;
   font-size: 12px;
@@ -381,6 +393,37 @@ code {
 }
 .fail-box strong { font-size: 12px; color: var(--danger); }
 .fail-box .fail-line {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+/* Run history: a collapsed, bounded list of the last few scheduled runs, so
+   the panel can answer "did this actually run yesterday?" without turning the
+   summary into a log. Kept visually lighter than .fail-box because history is
+   reassurance, not something to act on. */
+.history-box {
+  margin-top: 8px;
+  padding: 6px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+}
+.history-box > summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.history-list {
+  margin: 6px 0 2px;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.history-list li {
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.5;
@@ -476,6 +519,7 @@ code {
 /* A running sync reports progress in the same slot as the result, so it is
    tinted to read as in-progress rather than as a settled answer. */
 #mail-status-msg.busy { color: var(--accent); }
+#naukri-status-msg.busy { color: var(--accent); }
 
 /* ---- Responsive ------------------------------------------------------
    Five columns stop being readable well before they stop fitting, so the board

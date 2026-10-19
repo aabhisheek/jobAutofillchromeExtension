@@ -8,14 +8,16 @@
   <body>
     <h1>Tailor Resume for a Job Description</h1>
     <p class="muted">
-      Paste a job description below. Keywords it uses that already match something true in your
-      <code>profile.json</code> (skills, experience, projects) get surfaced into the resume as an
-      extra ATS-scannable line — nothing is fabricated. Keywords with no match in your profile are
-      listed as gaps for you to review, never inserted automatically. Your resume PDF is the source:
-      its text and structure are read back into LaTeX, previewed here as rendered A4 pages (old vs.
-      new), and written back out as a PDF via "Save as PDF". The PDF this extension already has is
-      picked up automatically — upload another below to replace it. Nothing is uploaded anywhere by
-      this page.
+      Paste a job description below. The description's role is detected (Data Engineer, AI Engineer,
+      Java Developer, …; falling back to Full Stack Developer) and the resume is rewritten for it —
+      every experience, project and skill reworded, and the timeline rescaled to the years the
+      description asks for, with the graduation year moved to match. Keywords the description uses
+      that match something true in your <code>profile.json</code> (skills, experience, projects) are
+      folded into the skills lineup; keywords with no match in your profile are listed as "Not added"
+      and never inserted. Your resume PDF is the source: its text and structure are read back into
+      LaTeX, previewed here as rendered A4 pages (old vs. new), and written back out as a PDF via
+      "Save as PDF". The PDF this extension already has is picked up automatically — upload another
+      below to replace it. Nothing is uploaded anywhere by this page.
     </p>
     <p class="muted">
       Opened this via the popup's "Tailor Resume for This Job" button? The description below was
@@ -33,9 +35,10 @@
       <summary>Use a .tex file instead (optional)</summary>
       <p class="muted">
         Only needed if you have LaTeX source and would rather not go through the PDF. Uploading a
-        PDF above is the normal path; this box takes over as the source when you use it. With neither
-        set, the "current" side is <code>resumeTexPath</code> from <code>settings.json</code>
-        (<code>src/data/resume.tex</code>).
+        PDF above is the normal path; this box takes over as the source when you use it. With
+        neither set, the "current" side is your resume PDF itself —
+        <code>resumePdfPath</code> from <code>settings.json</code> (or the PDF you uploaded above),
+        read and converted to LaTeX automatically.
       </p>
       <label class="field-label" for="tex-file-input">Upload a .tex file</label>
       <input type="file" id="tex-file-input" accept=".tex,text/plain" />
@@ -48,6 +51,54 @@
       </div>
     </details>
 
+    <div class="rewrite-box">
+      <h2>Rewrite for a target role</h2>
+      <p class="muted">
+        Picks a role playbook (Java Developer, AI Full Stack, Cloud Full Stack, Data Engineer, .NET,
+        Go/FinTech, React, Android, Superset, Cybersecurity, Data Analyst, …) and rewrites the
+        headline, summary, job titles, experience bullets, projects and skills to speak that role's
+        language — same companies, same facts. Optionally rescales the employment timeline so total
+        experience equals 1–7 years: durations keep their proportions, "Present" stays anchored to
+        today, and the company order never changes. A pasted job description above is auto-detected
+        to preselect the matching role.
+      </p>
+      <div class="toolbar">
+        <label class="field-label inline" for="role-select">Target role</label>
+        <select id="role-select">
+          <option value="java-developer">Java Developer</option>
+          <option value="ai-fullstack">AI Full Stack Developer</option>
+          <option value="ai-engineer">AI Engineer</option>
+          <option value="cloud-fullstack">Cloud Full Stack Developer</option>
+          <option value="fullstack">Full Stack Developer</option>
+          <option value="backend">Backend Developer</option>
+          <option value="data-engineer">Data Engineer</option>
+          <option value="data-analyst">Data Analyst</option>
+          <option value="dotnet">.NET Developer</option>
+          <option value="go-fintech">Go / FinTech Developer</option>
+          <option value="react-js">React / JavaScript Developer</option>
+          <option value="android">Android Developer</option>
+          <option value="superset">Apache Superset Developer</option>
+          <option value="cybersecurity">Cybersecurity Engineer</option>
+          <option value="custom">Custom role…</option>
+        </select>
+        <input type="text" id="role-custom-input" class="hidden" placeholder="Type the role title, e.g. Kotlin Backend Developer" />
+        <label class="field-label inline" for="years-select">Experience</label>
+        <select id="years-select" title="Rescale company dates so total experience equals this many years.">
+          <option value="">Keep current dates</option>
+          <option value="1">1 year</option>
+          <option value="2">2 years</option>
+          <option value="3">3 years</option>
+          <option value="4">4 years</option>
+          <option value="5">5 years</option>
+          <option value="6">6 years</option>
+          <option value="7">7 years</option>
+        </select>
+        <label class="field-label inline"><input type="checkbox" id="polish-checkbox" /> Polish wording with AI</label>
+        <button id="rewrite-btn" type="button">Rewrite for Role</button>
+        <span id="rewrite-status" class="muted"></span>
+      </div>
+    </div>
+
     <label class="field-label" for="jd-input">Job description</label>
     <textarea id="jd-input" placeholder="Paste the job description here…"></textarea>
 
@@ -59,11 +110,11 @@
     <div id="results" class="hidden">
       <div class="keyword-section">
         <div>
-          <h2>Matched keywords <span class="muted">(true, added if missing from the resume)</span></h2>
+          <h2>Matched <span class="muted">(JD keywords that match your profile — folded into the skills)</span></h2>
           <div id="matched-chips" class="chip-row"></div>
         </div>
         <div>
-          <h2>Gaps <span class="muted">(in the JD, not found in your profile — review manually)</span></h2>
+          <h2>Not added <span class="muted">(JD keywords with no match in your profile — left out)</span></h2>
           <div id="missing-chips" class="chip-row"></div>
         </div>
       </div>
@@ -115,6 +166,7 @@
     <script src="../lib/schema.js"></script>
     <script src="../lib/providers.js"></script>
     <script src="../lib/resume-tailor.js"></script>
+    <script src="../lib/resume-rewriter.js"></script>
     <script src="../lib/latex-preview.js"></script>
     <script src="../lib/pdf-extract.js"></script>
     <script src="../lib/analytics.js"></script>

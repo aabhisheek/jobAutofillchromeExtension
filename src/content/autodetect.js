@@ -13,6 +13,14 @@
 // helper nodes, but neither changes how many input/textarea/select elements
 // exist. The observer watches childList only — not attributes — for the same
 // reason, since the scan's attribute stamping would otherwise re-trigger it.
+//
+// A form being present also arms auto-open of the side panel. Chrome refuses
+// chrome.sidePanel.open() unless it is called from a user gesture, and a
+// form-detected report carries none: the gesture has to start here, in the
+// page. So once a real application form is on screen the first ordinary
+// click or keypress on the page opens the panel — no toolbar icon involved.
+// One attempt per document, so a page the user later closes the panel on stays
+// closed.
 (function () {
   // Below this the page is a search box or a cookie banner, not an
   // application. Each report makes the panel re-render its review list, so
@@ -26,6 +34,51 @@
   // an SPA route change (same count, new URL) is still noticed.
   let lastSent = null;
   let timer = null;
+
+  // Auto-open state. `armed` is true while a gesture listener is installed (so
+  // repeated reports don't stack listeners); `openRequested` latches once the
+  // panel has been asked for, so a second gesture never pops it back over a
+  // panel the user has since dismissed.
+  let armed = false;
+  let openRequested = false;
+
+  // The side panel is per-window, and this script runs in every frame
+  // (all_frames). Only the top frame arms the gesture, or a click inside an ad
+  // iframe could drive the panel of the page it happens to sit in. `window` is
+  // absent in the test realm, which reads as "top frame" — the only frame the
+  // tests describe.
+  function isTopFrame() {
+    return typeof window === "undefined" || window.top === window;
+  }
+
+  function requestOpen() {
+    if (openRequested) return;
+    openRequested = true;
+    // The worker's sidePanel.open() only succeeds because this message is sent
+    // from inside a real gesture handler. A report, by contrast, has no
+    // gesture and would be rejected there.
+    chrome.runtime
+      .sendMessage({ type: "autofill:open-panel", href: location.href })
+      .catch(() => {});
+  }
+
+  function armOpenOnInteraction() {
+    if (armed || openRequested || !isTopFrame()) return;
+    armed = true;
+
+    const onGesture = () => {
+      armed = false;
+      document.removeEventListener("pointerdown", onGesture, true);
+      document.removeEventListener("keydown", onGesture, true);
+      requestOpen();
+    };
+
+    // capture so the panel opens even when the page's own handlers stop
+    // propagation, and passive so this listener can never delay the
+    // interaction it is riding on.
+    document.addEventListener("pointerdown", onGesture, { capture: true, once: true, passive: true });
+    document.addEventListener("keydown", onGesture, { capture: true, once: true, passive: true });
+  }
 
   // Open shadow roots are pierced the same way describeFrames() in
   // page-scripts.js does it: several form widgets (date pickers, custom
@@ -47,6 +100,12 @@
     const controlCount = countControls();
     const href = location.href;
     if (controlCount < MIN_CONTROLS) return;
+
+    // Arm auto-open before the dedupe below: a form that has not changed is
+    // still a form the user is about to interact with. This only installs a
+    // listener; it sends nothing until the user actually touches the page.
+    armOpenOnInteraction();
+
     if (lastSent && lastSent.controlCount === controlCount && lastSent.href === href) return;
     lastSent = { controlCount, href };
 

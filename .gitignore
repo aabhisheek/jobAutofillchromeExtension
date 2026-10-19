@@ -1,4 +1,7 @@
 node_modules/
 .DS_Store
 *.log
+.env
 src/data/settings.json
+src/data/google-oauth.json
+src/data/client_secret_*.json

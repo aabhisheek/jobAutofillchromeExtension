@@ -78,8 +78,8 @@ const NEEDED = [...html.matchAll(/<([a-z0-9]+)[^>]*\sid="([^"]+)"/gi)];
 const registry = new Map();
 for (const [, tag, id] of NEEDED) registry.set(id, makeEl(tag, id));
 
-// <select id="mail-lookback"> needs its options for the "closest option" logic.
-registry.get("mail-lookback").options = [7, 30, 90].map((v) => ({ value: String(v) }));
+// <input id="mail-lookback" type="number"> — a free day count, so nothing needs
+// seeding here; the shim's value is whatever the code writes to it.
 
 // Elements carrying data-copy are found only by querySelectorAll, so they have to
 // come from the real markup too -- otherwise the copy-button assertions would run
@@ -133,6 +133,10 @@ const chromeMock = {
     getManifest: () => ({ version: "0.2.0" }),
     async sendMessage(msg) {
       if (msg.type === "mail:reschedule") return { ok: true, when: Date.now() + 3600_000 };
+      if (msg.type === "naukri:reschedule") return { ok: true, when: Date.now() + 3600_000 };
+      if (msg.type === "naukri:run") return { ok: true, edited: true, saved: true, reason: "" };
+      if (msg.type === "cloud:reschedule") return { ok: true, armed: false };
+      if (msg.type === "cloud:sync") return { ok: false, notes: ["not signed in"] };
       throw new Error("unexpected message " + msg.type);
     }
   },
@@ -140,7 +144,10 @@ const chromeMock = {
   // Derived from runtime.id, as Chrome does. A hardcoded host that disagreed
   // with the id would make the redirect-URI assertion meaningless.
   identity: {
-    getRedirectURL: (p) => `https://abcdefghijklmnopabcdefghijklmnop.chromiumapp.org/${p || ""}`
+    getRedirectURL: (p) => `https://abcdefghijklmnopabcdefghijklmnop.chromiumapp.org/${p || ""}`,
+    // The extension's own Google sign-in goes through launchWebAuthFlow; returns
+    // a code so the flow would reach the token exchange if the client were set.
+    launchWebAuthFlow: async () => "https://abcdefghijklmnopabcdefghijklmnop.chromiumapp.org/?code=fake"
   }
 };
 
@@ -150,6 +157,11 @@ let settingsWrites = 0;
 
 // Records what the copy buttons hand to the clipboard.
 copied = [];
+
+// What fetch() answers for the bundled src/data/settings.json. Empty for most
+// of the run so the storage-backed assertions stand alone; the credentials
+// section at the bottom fills it in to prove the file's values land on screen.
+let bundledFile = {};
 
 const ctx = vm.createContext({
   chrome: chromeMock,
@@ -177,22 +189,57 @@ const ctx = vm.createContext({
   Promise,
   Boolean,
   structuredClone,
+  AbortController,
+  AbortSignal,
   Blob: class {},
-  fetch: async (url) => {
-    if (String(url).includes("settings.json")) return { ok: true, json: async () => ({}) };
+  crypto,
+  btoa,
+  atob,
+  TextEncoder,
+  TextDecoder,
+  Uint8Array,
+  fetch: async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes("settings.json")) return { ok: true, json: async () => bundledFile };
+    if (u.includes("/chat/completions")) {
+      // A minimal, well-formed AI answer: it echoes each `=== ref: eN ===` tag
+      // with no fields, so mergeAiFields keeps the local parse — the panel's
+      // card assertions are about those local values — while the email still
+      // counts as AI-read, which the default (AI-only cards) requires before a
+      // card is allowed onto the board.
+      const body = JSON.parse(init.body || "{}");
+      const content = String((body.messages && body.messages[0] && body.messages[0].content) || "");
+      const refs = [...content.matchAll(/=== ref: (\S+) ===/g)].map((m) => m[1]);
+      const reply = refs.length
+        ? refs.map((ref) => ({ ref }))
+        : {};
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: JSON.stringify(reply) }, finish_reason: "stop" }] })
+      };
+    }
     throw new Error("unexpected fetch " + url);
   }
 });
 
-for (const f of ["src/lib/schema.js", "src/lib/providers.js", "src/lib/tracker.js"]) {
+for (const f of ["src/lib/schema.js", "src/lib/providers.js", "src/lib/tracker.js", "src/lib/scheduler-state.js"]) {
   vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), ctx, { filename: f });
 }
 
 ctx.Gmail = {
   async getConnection() { return connected ? { connected: true, email: "me@gmail.com" } : { connected: false, email: "" }; },
+  async hasCredentials() { return true; },
   async connect() { connected = true; connectCalls++; return { connected: true, email: "me@gmail.com" }; },
   async disconnect() { connected = false; }
 };
+// The cloud sign-in lib loads right after gmail.js in the real page (it reuses
+// Gmail's client resolution), so it is loaded here too. Without it dashboard.js's
+// initAccountPanel would fail on an undefined Cloud — which is exactly the class
+// of breakage this file exists to catch.
+vm.runInContext(fs.readFileSync(path.join(ROOT, "src/lib/cloud.js"), "utf8"), ctx, { filename: "cloud.js" });
+vm.runInContext(fs.readFileSync(path.join(ROOT, "src/lib/supabase.js"), "utf8"), ctx, { filename: "supabase.js" });
+vm.runInContext(fs.readFileSync(path.join(ROOT, "src/lib/cloud-sync.js"), "utf8"), ctx, { filename: "cloud-sync.js" });
 vm.runInContext(fs.readFileSync(path.join(ROOT, "src/lib/mail-import.js"), "utf8"), ctx, { filename: "mail-import.js" });
 
 // Discovery's dependencies, in the order dashboard.html loads them: the
@@ -204,6 +251,7 @@ for (const f of ["src/lib/resume-tailor.js", "src/lib/page-scripts.js", "src/lib
 
 // One message, so the sync has something real to do without a Gmail mock.
 ctx.Gmail.listMessageIds = async () => ["m1"];
+ctx.Gmail.listAllMessageIds = async () => ["m1"];
 ctx.Gmail.getMessage = async () => ({
   id: "m1",
   subject: "Your application for Backend Engineer at Acme Corp",
@@ -226,23 +274,34 @@ const ok = (l, cond) => eq(l, !!cond, true);
 
   console.log("--- initial state ---");
   eq("panel says not connected", el("mail-conn-state").textContent, "Not connected");
-  eq("setup visible (no client id)", el("mail-setup").className, "");
-  eq("connect disabled with no client id", el("mail-connect").disabled, true);
+  // No stored credentials are needed to connect: the OAuth client is bundled.
+  eq("connect is enabled with no stored credentials", el("mail-connect").disabled, false);
 
-  // The connection diagnostics. These are what you read when connecting fails,
-  // so an empty value here is the difference between a solvable problem and an
-  // unexplained one.
+  // The credential fields are gone from the UI entirely. The client id and
+  // secret live in src/data/google-oauth.json, so there is nothing for a user
+  // to type and nothing to keep in sync with Google Cloud from this panel.
+  console.log("--- no credential fields are rendered ---");
+  for (const id of [
+    "mail-setup",
+    "mail-client-id",
+    "mail-client-secret",
+    "mail-ext-id",
+    "mail-redirect-uri",
+    "mail-cred-note",
+    "mail-save-client",
+    "mail-setup-msg"
+  ]) {
+    eq(`no #${id} in the markup`, html.includes(`id="${id}"`), false);
+  }
+
+  // The remaining diagnostics. The build stamp is what proves the current code
+  // is running behind a cached page.
   console.log("--- diagnostics shown ---");
   const stamp = el("mail-build").textContent;
   ok("build stamp rendered (proves current code is running)", !!stamp && stamp.length > 4);
-  ok("extension id rendered", /^[a-p]{32}$/.test(el("mail-ext-id").textContent));
-  eq("redirect uri rendered as the bare origin",
-     el("mail-redirect-uri").textContent,
-     `https://${el("mail-ext-id").textContent}.chromiumapp.org/`);
-  eq("credentials block is NOT inside the collapsing setup",
-     el("mail-client-id").closest("mail-setup"), null);
   eq("AI toggle available (a provider key is configured)", el("mail-use-ai").disabled, false);
   eq("AI toggle on by default", el("mail-use-ai").checked, true);
+  eq("AI-only toggle on by default", el("mail-require-ai").checked, true);
   eq("daily toggle on by default", el("mail-enabled").checked, true);
   eq("frequency defaulted to every 2 hours", el("mail-every").value, "2h");
   eq("daily time row hidden on an interval schedule",
@@ -250,43 +309,7 @@ const ok = (l, cond) => eq(l, !!cond, true);
   eq("query prefilled from defaults", el("mail-query").value.includes("application received"), true);
   eq("lookback defaulted to 30", el("mail-lookback").value, "30");
   ok("last run line exists", el("mail-last-run").textContent.length > 0);
-
-  // The values pasted into Google Cloud. Copying beats transcribing here: Google
-  // compares redirect URIs as exact strings, so a dropped trailing slash is a
-  // mismatch with no other visible cause.
-  console.log("--- copy buttons hand over the exact strings ---");
-  eq("two copy buttons exist", COPY_BUTTONS.length, 2);
-  for (const button of COPY_BUTTONS) {
-    await button.fire("click");
-  }
-  eq("extension id copied", copied[0] ?? null, el("mail-ext-id").textContent);
-  eq("redirect uri copied", copied[1] ?? null, el("mail-redirect-uri").textContent);
-  // Both checks read copied[1] defensively: with nothing copied, a bare
-  // .endsWith() would throw and take the whole harness file down with it, losing
-  // every other suite's result in the run.
-  eq("redirect uri copied keeps the trailing slash Google requires",
-     (copied[1] || "").endsWith(".chromiumapp.org/"), true);
-  // Strip scheme + host + the single path slash, and what must remain is the
-  // bare origin. A stray "/oauth2" here is the original redirect bug, so it is
-  // worth asserting the path is genuinely absent rather than merely plausible.
-  eq("redirect uri copied is the bare origin, with no path after it",
-     (copied[1] || "").replace(/^https:\/\/[^/]+\/?/, ""), "");
-  // Confirmation is the point of the label swap; the reset runs on a 1600ms timer,
-  // which a synchronous test cannot observe without slowing the suite down.
-  eq("button confirms the copy", COPY_BUTTONS[0].textContent, "Copied");
-
-  console.log("--- saving a bad client id is rejected ---");
-  el("mail-client-id").value = "nonsense";
-  await el("mail-save-client").fire("click");
-  ok("bad id rejected", /apps\.googleusercontent/i.test(el("mail-setup-msg").textContent));
-  eq("setup error class", el("mail-setup-msg").className.includes("err"), true);
-
-  console.log("--- saving a good client id ---");
-  el("mail-client-id").value = "123.apps.googleusercontent.com";
-  await el("mail-save-client").fire("click");
-  ok("saved", /Saved/i.test(el("mail-setup-msg").textContent));
-  eq("connect now enabled", el("mail-connect").disabled, false);
-  eq("setup collapsed away", el("mail-setup").className, "hidden");
+  ok("dedicated AI tally row exists in the panel", html.includes('id="mail-ai-stats"'));
 
   console.log("--- connecting ---");
   await el("mail-connect").fire("click");
@@ -297,6 +320,9 @@ const ok = (l, cond) => eq(l, !!cond, true);
   // The first import runs itself once the grant is done — asking for one more
   // click to see your own history is the bug this replaced.
   ok("the first import ran itself, no Sync now click", /added/i.test(el("mail-status-msg").textContent));
+  // The AI tally is its own always-visible row, not just the passing status text.
+  ok("AI tally shows the live counts", /AI: \d+ enriched/.test(el("mail-ai-stats").textContent));
+  ok("AI tally is not hidden after the run", !el("mail-ai-stats").className.includes("hidden"));
 
   console.log("--- saving schedule settings ---");
   // The time row follows the frequency: on until "Once a day" is chosen, off
@@ -311,18 +337,31 @@ const ok = (l, cond) => eq(l, !!cond, true);
      el("mail-time-row").className.includes("hidden"), true);
   el("mail-enabled").checked = true;
   el("mail-time").value = "07:15";
-  el("mail-lookback").value = "90";
+  el("mail-lookback").value = "123";
   el("mail-query").value = 'newer_than:14d {"application received"}';
   el("mail-use-ai").checked = false;
+  el("mail-require-ai").checked = false;
   await el("mail-save").fire("click");
   eq("frequency persisted", store.settings.emailSyncEvery, "2h");
   eq("time persisted", store.settings.emailSyncTime, "07:15");
   eq("enabled persisted", store.settings.emailSyncEnabled, true);
-  eq("lookback persisted as a number", store.settings.emailLookbackDays, 90);
+  eq("an arbitrary day count persists (not snapped to a preset)", store.settings.emailLookbackDays, 123);
   eq("query persisted", store.settings.emailSyncQuery, 'newer_than:14d {"application received"}');
   eq("useAi persisted", store.settings.emailUseAi, false);
+  eq("AI-only persisted", store.settings.emailRequireAi, false);
   eq("provider key survived the save", store.settings.groqApiKey, "gsk_test");
   ok("status quotes the rhythm", /every 2 hours/.test(el("mail-status-msg").textContent));
+
+  console.log("--- the look-back count is clamped and defaults sanely ---");
+  el("mail-lookback").value = "0";
+  await el("mail-save").fire("click");
+  eq("a non-positive count falls back to 30", store.settings.emailLookbackDays, 30);
+  el("mail-lookback").value = "999999";
+  await el("mail-save").fire("click");
+  eq("an absurd count is capped at ten years", store.settings.emailLookbackDays, 3650);
+  el("mail-lookback").value = "";
+  await el("mail-save").fire("click");
+  eq("a blank box falls back to 30", store.settings.emailLookbackDays, 30);
 
   console.log("--- syncing now ---");
   el("mail-sync-now").disabled = false;
@@ -344,6 +383,19 @@ const ok = (l, cond) => eq(l, !!cond, true);
   await el("mail-sync-now").fire("click");
   eq("still one card", (await T().list()).length, 1);
   ok("reported as already imported", /already imported/i.test(el("mail-status-msg").textContent));
+
+  console.log("--- reset & rebuild wipes the board and re-imports from mail ---");
+  // A hand-added card rides along, so the wipe is shown to clear everything —
+  // not just the rows that came from email.
+  await T().save({ title: "Hand added", company: "Manual Co", status: "saved" });
+  eq("two cards before the rebuild", (await T().list()).length, 2);
+  el("mail-lookback").value = "45";
+  await vm.runInContext("rebuildFromMail()", ctx);
+  const rebuilt = await T().list();
+  eq("the board was rebuilt from mail alone", rebuilt.length, 1);
+  eq("the hand-added card was removed too", rebuilt.every((row) => row.title !== "Hand added"), true);
+  eq("and the imported card is back", rebuilt[0].sourceEmailId, "m1");
+  eq("the window used is the one in the box", store.settings.emailLookbackDays, 45);
 
   console.log("--- reopening the dashboard syncs without a click ---");
   el("mail-status-msg").textContent = "";
@@ -392,6 +444,20 @@ const ok = (l, cond) => eq(l, !!cond, true);
   eq("reason box hidden again", el("mail-last-run-errors").className.includes("hidden"), true);
   eq("and emptied", el("mail-last-run-errors").textContent, "");
   ok("summary reports the additions", /2 new/.test(el("mail-last-run").textContent));
+
+  console.log("--- deferred emails are shown as waiting, not as silently dropped ---");
+  store.emailSyncState = {
+    at: Date.now(), ok: true, notes: [], scanned: 4, added: 1, updated: 0,
+    skipped: 0, failed: 0, aiEnriched: 1, aiSkipped: 2, aiFailed: 0,
+    deferred: 2, aiOn: true, aiRequired: true
+  };
+  for (const fn of listeners) fn({ emailSyncState: { newValue: store.emailSyncState } }, "local");
+  await new Promise((r) => setTimeout(r, 20));
+  ok("summary counts the waiting cards", /2 waiting for AI/.test(el("mail-last-run").textContent));
+  ok("the AI-only run words a cap skip as 'over the AI limit', not a local fallback",
+     /2 over the AI limit/.test(el("mail-last-run").textContent));
+  ok("the dedicated tally also shows the waiting count",
+     /2 waiting for AI/.test(el("mail-ai-stats").textContent));
 
   console.log("--- a storage change from the worker re-renders the last-run line ---");
   store.emailSyncState = { at: Date.now(), ok: false, notes: ["Gmail is not connected. Press Connect Gmail first."], scanned: 0, added: 0, updated: 0, skipped: 0, failed: 0, aiEnriched: 0, aiSkipped: 0 };
@@ -572,5 +638,119 @@ const ok = (l, cond) => eq(l, !!cond, true);
   eq("settings repopulated the fields on re-init",
      el("discover-roles").value, "Backend Engineer, SRE");
 
-  process.exit(done() ? 1 : 0);
+  // ---- credentials are no longer panel state -------------------------------
+  // The OAuth client ships in src/data/google-oauth.json and is resolved by
+  // gmail.js at connect time. The panel therefore has no client id or secret to
+  // render or persist, and connecting must never depend on anything saved here.
+  console.log("--- the panel needs no stored credentials ---");
+  delete store.settings.gmailClientId;
+  delete store.settings.gmailClientSecret;
+  await vm.runInContext("initMailPanel()", ctx);
+  eq("connect stays enabled on a fresh profile", el("mail-connect").disabled, false);
+  eq("no client id is written back into storage", store.settings.gmailClientId, undefined);
+  ok("the markup carries no credential fields", !html.includes('id="mail-client-id"'));
+
+  console.log("--- the Naukri profile refresh panel ---");
+  // Re-run the init the way the mail section does: the point of the test is
+  // that every listener binds to an element the real markup provides, and a
+  // listener that vanished with a typo'd id would otherwise pass silently.
+  await vm.runInContext("initNaukriPanel()", ctx);
+  eq("switch shows the shipped default", el("naukri-enabled").checked, true);
+  eq("time shows the shipped default", el("naukri-time").value, "08:00");
+
+  el("naukri-enabled").checked = true;
+  el("naukri-time").value = "07:45";
+  await el("naukri-save").fire("click");
+  eq("refresh enabled stored", store.settings.naukriRefreshEnabled, true);
+  eq("refresh time stored", store.settings.naukriRefreshTime, "07:45");
+  ok("save confirmed", /^Saved/.test(el("naukri-status-msg").textContent));
+  ok("status marked ok", el("naukri-status-msg").className.includes("ok"));
+  ok("quotes the saved time", el("naukri-status-msg").textContent.includes("07:45"));
+
+  el("naukri-enabled").checked = false;
+  await el("naukri-save").fire("click");
+  eq("switch off stored", store.settings.naukriRefreshEnabled, false);
+  ok("off is stated plainly", el("naukri-status-msg").textContent.includes("off"));
+
+  // "Refresh now" reports the content script's own outcome verbatim — the
+  // button must end re-enabled no matter what the worker answered.
+  await el("naukri-run").fire("click");
+  ok("run result shown", el("naukri-status-msg").textContent.includes("Done — the resume headline was toggled"));
+  ok("status marked ok after the run", el("naukri-status-msg").className.includes("ok"));
+  eq("button re-enabled", el("naukri-run").disabled, false);
+
+  // The page-head button runs the identical flow without expanding the panel,
+  // so it must bind to a real element and behave the same as "Refresh now".
+  el("naukri-panel").open = false;
+  await el("update-naukri").fire("click");
+  ok("header run reports the same outcome", el("naukri-status-msg").textContent.includes("Done — the resume headline was toggled"));
+  eq("header run opened the panel", el("naukri-panel").open, true);
+  eq("panel button re-enabled after the header run", el("naukri-run").disabled, false);
+
+  console.log("--- cloud account panel ---");
+  // Signed out at boot is the whole panel's default view; the board works
+  // without an account, so nothing here may gate it.
+  eq("says signed out", el("account-state").textContent, "Signed out");
+  eq("sign-in button is shown", el("account-signin").classList.contains("hidden"), false);
+  eq("sign-out button is hidden", el("account-signout").classList.contains("hidden"), true);
+  // No bundled project on this build: an unset URL/key stays blank rather than
+  // silently pointing the sync at a project the user did not choose.
+  eq("supabase URL starts blank", el("account-supabase-url").value, "");
+  eq("supabase anon key starts blank", el("account-supabase-key").value, "");
+
+  // The panel persists an override into the same settings record the rest of
+  // the page reads.
+  el("account-supabase-url").value = "https://custom.supabase.co";
+  el("account-supabase-key").value = "anon-key-1234567890";
+  await el("account-save").fire("click");
+  eq("saves the supabase URL", store.settings.supabaseUrl, "https://custom.supabase.co");
+  eq("saves the supabase anon key", store.settings.supabaseAnonKey, "anon-key-1234567890");
+  ok("acknowledges the save", /Saved/i.test(el("account-status-msg").textContent));
+
+  // Proves the sign-in listener is bound to a real element: the Google flow
+  // needs the extension's own Google client (Gmail.resolveCredentials), which
+  // this harness does not provide, so the panel reports that rather than
+  // silently doing nothing.
+  await el("account-signin").fire("click");
+  ok("sign-in reports the missing Google client", /Google client|sign-in/i.test(el("account-status-msg").textContent));
+
+  console.log("--- stopping a sync in progress ---");
+  // The run is driven through runMailSync directly rather than the button's
+  // click listener: the "reopening the dashboard" test above calls
+  // initMailPanel() a second time, which (as a real page reload would not in
+  // the same context) leaves two click listeners on the button, and firing it
+  // would start a second run. Calling the run entry point keeps this test
+  // about Stop, not about that listener-accumulation artifact of simulating a
+  // reload inside one context.
+  //
+  // The listing step is held open so the run is genuinely in flight when Stop
+  // is pressed — the only way to prove the button is shown during a live run
+  // and that pressing it cancels that run rather than a later one. The signal
+  // is read after the listing resolves, so the hold alone is determinative.
+  const realListAll = ctx.Gmail.listAllMessageIds;
+  let releaseList = null;
+  ctx.Gmail.listAllMessageIds = () => new Promise((resolve) => { releaseList = () => resolve([]); });
+
+  eq("stop button hidden when idle", el("mail-sync-stop").hidden, true);
+  connected = true;
+  const pendingRun = vm.runInContext("runMailSync({ force: true, full: true })", ctx);
+  const reached = Date.now() + 2000;
+  while (!releaseList && Date.now() < reached) await new Promise((r) => setTimeout(r, 5));
+  eq("the run reached the read step", !!releaseList, true);
+  eq("stop button shown during a run", el("mail-sync-stop").hidden, false);
+  eq("read button disabled during a run", el("mail-sync-now").disabled, true);
+
+  await el("mail-sync-stop").fire("click");
+  eq("stop disables itself", el("mail-sync-stop").disabled, true);
+
+  releaseList();
+  const report = await pendingRun;
+  eq("the run reports the stop, not a failure", report.aborted, true);
+  eq("the stopped run is still a finished run", report.ok, true);
+  eq("stop button hidden again once the run ends", el("mail-sync-stop").hidden, true);
+  eq("read button usable again", el("mail-sync-now").disabled, false);
+  ok("status reports the stop", /Stopped/i.test(el("mail-status-msg").textContent));
+  ctx.Gmail.listAllMessageIds = realListAll;
+
+  process.exitCode = done() ? 1 : 0;
 })();

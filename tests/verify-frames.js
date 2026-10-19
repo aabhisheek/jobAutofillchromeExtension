@@ -224,8 +224,8 @@ eq("and the fixture has no iframes to count", shadowDesc.frames, 0);
 // ---- every injected entry point carries the same shadow-piercing helper ----
 //
 // scanFormFields, describeFrames, waitForFormReady, probePageState,
-// fillFormFields, highlightReviewFields, fillResumeFile, fillResumeByDrop and
-// advanceStep are serialized one function at a time, so each carries its own
+// fillFormFields, highlightReviewFields, fillResumeFile, fillResumeByDrop,
+// advanceStep and copyFormData are serialized one function at a time, so each carries its own
 // copy of querySelectorDeep. Copies that drift would fix one path and leave
 // the others blind, so they are compared byte for byte.
 const helperCopies = [];
@@ -249,7 +249,7 @@ for (
   helperCopies.push(pageScripts.slice(at, end));
 }
 
-eq("nine copies of querySelectorDeep ship", helperCopies.length, 9);
+eq("ten copies of querySelectorDeep ship", helperCopies.length, 10);
 ok("and every copy is byte-identical", helperCopies.every((copy) => copy === helperCopies[0]));
 
 // ---- The popup's frame plumbing, over a fake tab ----

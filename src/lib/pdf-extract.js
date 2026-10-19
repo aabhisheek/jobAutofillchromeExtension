@@ -650,6 +650,10 @@ function loadPdfJs() {
       finish(null);
     };
     script.onerror = () => finish(new Error(`Could not load ${url}`));
+    // Without a src the element is an empty inline script: nothing loads and
+    // window.pdfjsLib never appears, so every PDF import would time out (or
+    // report "pdfjsLib is missing") and leave the resume with no source.
+    script.src = url;
     document.head.appendChild(script);
   }).catch((err) => {
     pdfJsPromise = null;

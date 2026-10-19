@@ -305,7 +305,12 @@ document.getElementById("save").addEventListener("click", async () => {
 });
 
 document.getElementById("download").addEventListener("click", () => {
-  const blob = new Blob([JSON.stringify(settingsFromFields(), null, 2)], { type: "application/json" });
+  // Over the merged settings, not just the fields on this page: the footnote
+  // tells the user to drop the download straight over src/data/settings.json,
+  // and a file containing only the AI keys would silently take the Gmail
+  // credentials, the resume paths and the sync schedule with it.
+  const payload = { ...currentSettings, ...settingsFromFields() };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;

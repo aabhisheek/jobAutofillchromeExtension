@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AI Evals — Job Application Autofill</title>
+    <link rel="stylesheet" href="../lib/theme.css" />
+    <link rel="stylesheet" href="evals.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand"><span class="mark"></span><span class="name">Job Application Autofill</span></div>
+        <a class="nav-item" href="../options/options.html">Profile</a>
+        <a class="nav-item" href="../dashboard/dashboard.html">Dashboard</a>
+        <a class="nav-item active" href="evals.html">AI Evals</a>
+        <a class="nav-item" href="../keys/keys.html">API Keys</a>
+        <div class="sidebar-foot"><div class="theme-switch" role="group" aria-label="Appearance"><button type="button" data-theme-value="system">Auto</button><button type="button" data-theme-value="light">Light</button><button type="button" data-theme-value="dark">Dark</button></div><p class="sidebar-note">Runs and expected results stay in this browser.</p></div>
+      </aside>
+      <main class="main"><div class="main-inner">
+        <div class="page-head"><div><h1>AI Evals</h1><p class="sub">Review what AI extracted or decided, save corrected outputs as expected results, then use changes in pass rate to judge prompt updates.</p></div><div class="actions"><button id="clear" class="ghost">Clear history</button></div></div>
+        <div class="version"><label for="prompt-version">Prompt version</label><input id="prompt-version" type="text" maxlength="80" placeholder="e.g. gmail-v2" /><button id="save-version">Save version</button><span id="version-status"></span></div>
+        <div id="summary" class="summary"></div>
+        <p class="privacy">Captured runs use short, structured summaries. Full Gmail bodies and profile values are not stored here.</p>
+        <div id="runs" class="runs"></div>
+      </div></main>
+    </div>
+    <script src="../lib/theme.js"></script><script src="../lib/ai-evals.js"></script><script src="evals.js"></script>
+  </body>
+</html>

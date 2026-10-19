@@ -11,7 +11,17 @@
 // a plain JSON POST, so a ~150-line client keeps this project dependency-free
 // and buildless, exactly like the rest of src/lib.
 
-importScripts("/src/lib/schema.js", "/src/lib/providers.js", "/src/lib/tracker.js", "/src/lib/gmail.js", "/src/lib/mail-import.js");
+importScripts(
+  "/src/lib/schema.js",
+  "/src/lib/providers.js",
+  "/src/lib/tracker.js",
+  "/src/lib/scheduler-state.js",
+  "/src/lib/gmail.js",
+  "/src/lib/mail-import.js",
+  "/src/lib/cloud.js",
+  "/src/lib/supabase.js",
+  "/src/lib/cloud-sync.js"
+);
 
 const MIXPANEL_TRACK_URL = "https://api.mixpanel.com/track";
 const MIXPANEL_ENGAGE_URL = "https://api.mixpanel.com/engage";
@@ -257,6 +267,24 @@ async function isMinimized() {
   return minimized === true;
 }
 
+// A synchronous mirror of the minimized flag, for the auto-open path only.
+//
+// chrome.sidePanel.open() must be called during the user gesture, and the
+// gesture is carried by the content script's message — but an `await` anywhere
+// before open() (including the storage read isMinimized() does) spends it, and
+// the call is then rejected. So the flag is cached in memory here: the content
+// script's click can consult it without yielding, and it is refreshed on
+// worker start and whenever storage changes.
+let panelMinimized = false;
+function refreshPanelMinimized() {
+  chrome.storage.local
+    .get(MINIMIZED_KEY)
+    .then((data) => {
+      panelMinimized = data[MINIMIZED_KEY] === true;
+    })
+    .catch(() => {});
+}
+
 // Single source of truth for the toolbar button.
 //
 // openPanelOnActionClick is ON whenever the panel is not minimized, so Chrome
@@ -327,7 +355,7 @@ async function handlePanelRequest(tab) {
 // read. An OS job would need a second process, a second auth path, and a way to
 // hand results across a process boundary — to do something an alarm already
 // does. The honest limitation is that an alarm missed while the browser was
-// closed is not replayed by Chrome, so the panel offers "Sync now" and the next
+// closed is not replayed by Chrome, so the panel offers "Read & Sync" and the next
 // day's run picks up anything missed (the importer is idempotent per message,
 // and the search window is a rolling 30 days).
 
@@ -394,6 +422,9 @@ async function scheduleEmailSync(settings) {
     const state = await MailImport.readSyncState().catch(() => null);
     const next = nextIntervalRunAt(state && state.at, period) || nextRunAt(settings.emailSyncTime);
     await chrome.alarms.create(EMAIL_ALARM, { when: next, periodInMinutes: period });
+    // Persisted so both UIs can show "next check" without re-deriving the
+    // schedule — the armed instant is the truth, and it lives here.
+    await SchedulerState.setNextRun("emailSync", next).catch(() => {});
     return next;
   }
 
@@ -402,6 +433,7 @@ async function scheduleEmailSync(settings) {
     when: next,
     periodInMinutes: DAY_MINUTES
   });
+  await SchedulerState.setNextRun("emailSync", next).catch(() => {});
   return next;
 }
 
@@ -432,19 +464,207 @@ async function reconcileEmailAlarm() {
     const settings = await MailImport.loadSettings();
     if (!settings.emailSyncEnabled) {
       await chrome.alarms.clear(EMAIL_ALARM);
+      // The schedule is off: no next run to advertise, and a stale instant
+      // from the previous schedule would be a lie the panel would render.
+      await SchedulerState.setNextRun("emailSync", null).catch(() => {});
       return null;
     }
     return await scheduleEmailSync(settings);
   } catch {
     // Best-effort: a missing alarm costs a scheduled run, and the panel's
-    // Sync now button still works.
+    // Read & Sync button still works.
     return null;
   }
 }
 
+
+
+const NAUKRI_REFRESH_ALARM = "naukri-profile-refresh";
+const NAUKRI_REFRESH_FIELDS = ["naukriRefreshEnabled", "naukriRefreshTime", "naukriRefreshUrl", "naukriRefreshEditPattern", "naukriRefreshCustomText"];
+
+async function scheduleNaukriRefresh(settings) {
+  const next = nextRunAt(settings.naukriRefreshTime || "08:00");
+  await chrome.alarms.create(NAUKRI_REFRESH_ALARM, {
+    when: next,
+    periodInMinutes: DAY_MINUTES
+  });
+  // Same reasoning as the email arm above: the pages render "next refresh"
+  // from this, and the armed instant beats a recomputation.
+  await SchedulerState.setNextRun("naukriRefresh", next).catch(() => {});
+  return next;
+}
+
+let naukriRefreshInFlight = null;
+
+// Every outcome — success, content-script refusal, thrown error — is recorded
+// through SchedulerState.recordNaukriRun, so "when did this last work?" always
+// has an answer. The alarm's fire-and-forget path used to discard the result
+// entirely, which is why a week of silent failures was invisible.
+function runNaukriRefresh(options = {}) {
+  const trigger = options.trigger || "alarm";
+  if (!naukriRefreshInFlight) {
+    naukriRefreshInFlight = (async () => {
+      const settings = await loadSettings();
+      try {
+        const result = await triggerNaukriProfileRefresh(settings, options);
+        // "disabled" is a refusal, not a run: the schedule is off, so writing
+        // it into the history would read as a failure the user never asked to
+        // fix. Every other outcome — including a forced manual run — is kept.
+        if (result && result.reason !== "disabled") {
+          await SchedulerState.recordNaukriRun({ ...result, trigger }).catch(() => {});
+        }
+        return result;
+      } catch (err) {
+        const failure = { ok: false, reason: err.message, trigger };
+        await SchedulerState.recordNaukriRun(failure).catch(() => {});
+        return failure;
+      }
+    })().finally(() => {
+      naukriRefreshInFlight = null;
+    });
+  }
+  return naukriRefreshInFlight;
+}
+
+// The content script only exists once the tab's document has reached
+// document_idle, and a Naukri redirect (session expired -> login page, then
+// back) can reset the document after that. So the message is retried on a
+// one-second beat instead of fired once into the void: the old single attempt
+// failed silently whenever the tab was still loading, which is most of the
+// time, and the run reported ok while doing nothing.
+async function sendNaukriRefresh(tabId, message, attempts = 30) {
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (err) {
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+  return { ok: false, reason: `The Naukri tab never answered (${lastError && lastError.message}).` };
+}
+
+async function triggerNaukriProfileRefresh(settings, { force = false } = {}) {
+  if (!settings.naukriRefreshEnabled && !force) return { ok: false, reason: "disabled" };
+
+  const url = settings.naukriRefreshUrl || "https://www.naukri.com/mnjuser/profile";
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url, active: false });
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+
+  try {
+    const result = await sendNaukriRefresh(tab.id, {
+      type: "naukri:refresh",
+      editPattern: settings.naukriRefreshEditPattern || "dots",
+      customText: settings.naukriRefreshCustomText || " .",
+      profileUrl: url,
+      // The tab is opened with active:false, so the content script's render is
+      // frozen: the drawer never closes and the last-updated line never repaints
+      // even after a save that went through. Saying so explicitly stops the run
+      // from reading that freeze as "the change did not save".
+      backgroundTab: true
+    });
+    return { ...(result || { ok: false, reason: "No answer from the tab." }), url };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  } finally {
+    // Closed after the run so a daily alarm does not leave a tab open every
+    // morning. Best-effort: a tab the user already closed is fine.
+    if (tab && tab.id != null) chrome.tabs.remove(tab.id).catch(() => {});
+  }
+}
+
+async function reconcileNaukriRefreshAlarm() {
+  try {
+    const settings = await loadSettings();
+    if (!settings.naukriRefreshEnabled) {
+      await chrome.alarms.clear(NAUKRI_REFRESH_ALARM);
+      // Same as the email path: off means no next run, and a leftover instant
+      // would be rendered as a promise the schedule no longer keeps.
+      await SchedulerState.setNextRun("naukriRefresh", null).catch(() => {});
+      return null;
+    }
+    return await scheduleNaukriRefresh(settings);
+  } catch {
+    return null;
+  }
+}
+
+// ---- scheduled Supabase sync --------------------------------------------
+//
+// A third alarm, alongside email sync and the Naukri refresh: every
+// CLOUD_SYNC_INTERVAL_MINUTES it runs CloudSync.pushPull() when — and only
+// when — the user is signed in AND Supabase is configured. The gate is
+// deliberate: an unsigned-in or unconfigured install must never make a network
+// call it cannot attribute to an account, and clearing the alarm (rather than
+// letting it fire and no-op) keeps that guarantee visible in chrome://alarms.
+//
+// The interval is fixed rather than user-configurable because the sync is
+// cheap (one metadata pass plus whatever changed) and the dashboard already
+// offers a manual "Sync now"; a settings field would be a knob with no
+// meaningful range to turn it through.
+
+const CLOUD_SYNC_ALARM = "job-cloud-sync";
+const CLOUD_SYNC_INTERVAL_MINUTES = 30;
+
+// Single-flight, same reasoning as the email and Naukri paths: a second
+// trigger arriving mid-sync must not start a parallel pushPull — the two
+// would race on the same storage keys and on the same Supabase rows.
+let cloudSyncInFlight = null;
+
+function runCloudSync(options = {}) {
+  if (!cloudSyncInFlight) {
+    cloudSyncInFlight = (async () => {
+      const settings = await loadSettings();
+      return CloudSync.pushPull(settings, options);
+    })().finally(() => {
+      cloudSyncInFlight = null;
+    });
+  }
+  return cloudSyncInFlight;
+}
+
+// Reconciles the alarm with the current session + Supabase configuration.
+// Runs on every worker start and whenever the session or the two Supabase
+// settings keys change — the user can sign in / paste a key from a page while
+// this worker is asleep, and the alarm has to follow.
+async function reconcileCloudSyncAlarm() {
+  try {
+    const settings = await loadSettings();
+    const armed = await CloudSync.shouldSyncAutomatically(settings);
+    if (armed) {
+      await chrome.alarms.create(CLOUD_SYNC_ALARM, {
+        periodInMinutes: CLOUD_SYNC_INTERVAL_MINUTES
+      });
+    } else {
+      await chrome.alarms.clear(CLOUD_SYNC_ALARM);
+    }
+    return armed;
+  } catch {
+    // Best-effort: a missing alarm costs a background sync, and the
+    // dashboard's manual button still works.
+    return false;
+  }
+}
+
 // ---- wiring ----
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return false;
+
+  // Auto-open: the content script detects an application form, then sends this
+  // from the first ordinary click/keypress on the page. That gesture is what
+  // chrome.sidePanel.open() requires; the detection report itself carries none
+  // and would be rejected. Nothing is awaited before openPanel() — every await
+  // between the gesture and the call can spend it — and a minimized panel is
+  // left alone, since minimizing means "do not reopen until I ask".
+  if (message.type === "autofill:open-panel") {
+    if (!panelMinimized) openPanel(sender && sender.tab);
+    return false;
+  }
 
   // The panel runs the sync itself rather than asking this worker to, so it can
   // show progress as messages arrive. These messages are for the parts that have
@@ -476,6 +696,44 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  // The dashboard's "Refresh now" — the same run the alarm does, but forced,
+  // so it works with the schedule switched off, and answered with the content
+  // script's own report of what it changed. Tagged manual so the history can
+  // tell a click from the daily alarm.
+  if (message.type === "naukri:run") {
+    runNaukriRefresh({ force: true, trigger: "manual" })
+      .then((result) => sendResponse(result || { ok: false, reason: "No result." }))
+      .catch((err) => sendResponse({ ok: false, reason: err.message }));
+    return true;
+  }
+
+  // Re-arming the daily alarm after the panel changes the time or the switch.
+  if (message.type === "naukri:reschedule") {
+    reconcileNaukriRefreshAlarm()
+      .then((when) => sendResponse({ ok: true, when }))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  // The dashboard's "Sync now" button and the post-sign-in auto-sync both land
+  // here: the panel runs its own copy for instant feedback, but this worker
+  // also runs one so the sync happens even if the panel closes mid-flight.
+  if (message.type === "cloud:sync") {
+    runCloudSync()
+      .then((result) => sendResponse(result || { ok: false, notes: ["No result."] }))
+      .catch((err) => sendResponse({ ok: false, notes: [err.message] }));
+    return true;
+  }
+
+  // Re-arming the background sync alarm after sign-in / sign-out / a Supabase
+  // settings change.
+  if (message.type === "cloud:reschedule") {
+    reconcileCloudSyncAlarm()
+      .then((armed) => sendResponse({ ok: true, armed }))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
   if (message.type !== "analytics:track") return false;
 
   // Returning true (async response) is what keeps this worker alive long enough
@@ -487,8 +745,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== EMAIL_ALARM) return;
-  runEmailSync().catch(() => {});
+  if (alarm.name === EMAIL_ALARM) {
+    runEmailSync().catch(() => {});
+    return;
+  }
+  if (alarm.name === NAUKRI_REFRESH_ALARM) {
+    runNaukriRefresh().catch(() => {});
+    return;
+  }
+  if (alarm.name === CLOUD_SYNC_ALARM) {
+    runCloudSync().catch(() => {});
+    return;
+  }
 });
 
 // With no default_popup in the manifest, every toolbar click lands here.
@@ -505,10 +773,22 @@ chrome.commands.onCommand.addListener((command, tab) => {
 // re-runs from scratch on every worker start. setPanelBehavior() is
 // session-only state, so re-deriving it here is what makes "minimized until I
 // restore it" hold across restarts.
+// Settings keys that change when the background cloud-sync alarm should be
+// re-armed. Compared by key on a storage event, same as the two schedules
+// above, so an unrelated preference flip does not churn the alarm.
+const CLOUD_SYNC_FIELDS = ["cloudSession", "supabaseUrl", "supabaseAnonKey"];
+
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
-  if (MINIMIZED_KEY in changes) applyPanelState();
+  if (MINIMIZED_KEY in changes) {
+    // Keep the synchronous mirror honest before applyPanelState() (which is
+    // async) resolves, so an auto-open arriving in between sees the new value.
+    panelMinimized = changes[MINIMIZED_KEY].newValue === true;
+    applyPanelState();
+  }
   if (EMAIL_SCHEDULE_FIELDS.some((key) => key in changes)) reconcileEmailAlarm();
+  if (NAUKRI_REFRESH_FIELDS.some((key) => key in changes)) reconcileNaukriRefreshAlarm();
+  if (CLOUD_SYNC_FIELDS.some((key) => key in changes)) reconcileCloudSyncAlarm();
 });
 
 chrome.runtime.onInstalled.addListener(async ({ reason, previousVersion }) => {
@@ -527,12 +807,21 @@ chrome.runtime.onInstalled.addListener(async ({ reason, previousVersion }) => {
 chrome.runtime.onStartup.addListener(() => {
   flush().catch(() => {});
   reconcileEmailAlarm();
+  reconcileNaukriRefreshAlarm();
+  reconcileCloudSyncAlarm();
   // Chrome does not replay an alarm the browser slept through, and the browser
   // has only just opened — this is the natural moment to catch up on yesterday's
   // mail instead of waiting for the scheduled hour. Gated on the same setting
   // the alarm is, so a refused run never rewrites the panel's last-run line.
   MailImport.loadSettings()
     .then((settings) => (settings.emailSyncEnabled ? runEmailSync() : null))
+    .catch(() => {});
+  // Same reasoning for the Supabase sync: a laptop that was closed overnight
+  // should reconcile with the cloud on open, not half an hour from now. The
+  // call is gated inside runCloudSync (signed in + configured), so an
+  // unconfigured install makes no network request at all.
+  loadSettings()
+    .then((settings) => (CloudSync.shouldSyncAutomatically(settings) ? runCloudSync() : null))
     .catch(() => {});
 });
 flush().catch(() => {});
@@ -541,7 +830,12 @@ flush().catch(() => {});
 // live on the session, not the worker, and MV3 tears this worker down often.
 applyPanelState().catch(() => {});
 
+// Prime the synchronous minimized mirror the auto-open path reads.
+refreshPanelMinimized();
+
 // Same for the sync alarm: Chrome persists alarms across restarts, but the
 // schedule the user wants lives in storage and is edited from a page while this
 // worker sleeps. Reconciling here is what makes the two agree.
 reconcileEmailAlarm().catch(() => {});
+reconcileNaukriRefreshAlarm().catch(() => {});
+reconcileCloudSyncAlarm().catch(() => {});

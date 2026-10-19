@@ -3,8 +3,10 @@
 //
 // Why the API and not the Gmail web page: a DOM scraper breaks the week Google
 // renames a class, and it would have to steal a live tab. The API is a contract.
-// It does need the user to paste a Google Cloud OAuth client id once, which is
-// the price of never having this extension ask for a password.
+// It does need an OAuth client, but that client ships with the build in
+// src/data/google-oauth.json rather than being typed in: the price of never
+// having this extension ask for a password is paid once by whoever packages it,
+// and a user only ever presses Connect.
 //
 // What it asks for is gmail.readonly and nothing else — no send, no delete, no
 // label writes. The token lives in chrome.storage.local next to the rest of the
@@ -22,6 +24,14 @@ const GMAIL_AUTH_KEY = "gmailAuth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 const OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+
+// The one file that carries the OAuth client. It lives in the extension's own
+// files rather than in a settings field, because the whole point is that a
+// shared build already has a working client baked in: whoever receives the
+// extension presses Connect and nothing else. The file is gitignored (it holds
+// the client secret) and is not part of chrome.storage, so a fresh profile or a
+// cleared storage cannot lose it.
+const GOOGLE_OAUTH_FILE = "src/data/google-oauth.json";
 
 // Read-only, full stop. Gmail has no narrower scope that still lists messages.
 const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
@@ -107,6 +117,56 @@ function requiredOrigins() {
   return ["https://gmail.googleapis.com/*", "https://oauth2.googleapis.com/*"];
 }
 
+// The bundled client, read once and cached for the life of the context. Accepts
+// either the shape Google hands out for a downloaded client (`{ "web": {…} }`)
+// or a flat `{ client_id, client_secret }`, so dropping a fresh client_secret
+// file in as src/data/google-oauth.json just works. A missing or unreadable
+// file is not an error here: it resolves to empty fields and the caller falls
+// back to whatever is stored in settings.
+let bundledCredentialsPromise = null;
+
+function readBundledCredentials() {
+  if (!bundledCredentialsPromise) {
+    bundledCredentialsPromise = (async () => {
+      try {
+        const res = await fetch(chrome.runtime.getURL(GOOGLE_OAUTH_FILE));
+        if (!res || !res.ok) return {};
+        const data = await res.json();
+        const client = (data && (data.web || data.installed)) || data || {};
+        return {
+          clientId: String(client.client_id || client.clientId || "").trim(),
+          clientSecret: String(client.client_secret || client.clientSecret || "").trim(),
+          redirectUri: String(
+            (Array.isArray(client.redirect_uris) && client.redirect_uris[0]) ||
+            client.redirectUri ||
+            ""
+          ).trim()
+        };
+      } catch {
+        return {};
+      }
+    })();
+  }
+  return bundledCredentialsPromise;
+}
+
+// The client id and secret to use, from the bundled file first and the stored
+// settings second. The file wins so that a shared build always connects with
+// the client its author registered — a stale value left in someone's storage
+// from an older version cannot shadow it. Settings remain the fallback for the
+// tests and for anyone who wired a client up before the file existed.
+async function resolveCredentials(settings) {
+  const bundled = await readBundledCredentials();
+  const clientId = bundled.clientId || String((settings && settings.gmailClientId) || "").trim();
+  const clientSecret = bundled.clientSecret || String((settings && settings.gmailClientSecret) || "").trim();
+  return { clientId, clientSecret };
+}
+
+async function hasCredentials(settings) {
+  const { clientId } = await resolveCredentials(settings);
+  return !!clientId;
+}
+
 // ---- token lifecycle ---------------------------------------------------
 
 async function exchangeCodeForTokens(code, clientId, clientSecret, codeVerifier) {
@@ -189,11 +249,11 @@ async function ensureAccessToken(settings) {
 
   if (auth.expiresAt && auth.expiresAt - EXPIRY_MARGIN_MS > Date.now()) return auth;
 
-  const clientId = String((settings && settings.gmailClientId) || "").trim();
-  if (!clientId) throw new Error("Add your Google OAuth client id before syncing.");
+  const { clientId, clientSecret } = await resolveCredentials(settings);
+  if (!clientId) throw new Error("Gmail's OAuth client id is missing — reinstall the extension or add src/data/google-oauth.json.");
   if (!auth.refreshToken) throw new Error("Gmail needs reconnecting to get a refresh token.");
 
-  return refreshAccessToken(auth, clientId, String((settings && settings.gmailClientSecret) || "").trim());
+  return refreshAccessToken(auth, clientId, clientSecret);
 }
 
 // Single-use CSRF token for one consent attempt. Held in memory rather than
@@ -212,8 +272,8 @@ function newState() {
 // needs the optional host permissions granted first — a user who declines the
 // permission prompt should get an explanation, not an opaque OAuth failure.
 async function connect({ settings, interactive = true } = {}) {
-  const clientId = String((settings && settings.gmailClientId) || "").trim();
-  if (!clientId) throw new Error("Paste your Google OAuth client id first.");
+  const { clientId, clientSecret } = await resolveCredentials(settings);
+  if (!clientId) throw new Error("Gmail's OAuth client id is missing — reinstall the extension or add src/data/google-oauth.json.");
 
   const granted = await chrome.permissions.request({ origins: requiredOrigins() });
   if (!granted) throw new Error("Network access to Google was declined, so Gmail stays disconnected.");
@@ -221,7 +281,6 @@ async function connect({ settings, interactive = true } = {}) {
   const state = newState();
   pendingState = state;
 
-  const clientSecret = String((settings && settings.gmailClientSecret) || "").trim();
   const codeVerifier = randomVerifier();
   const codeChallenge = await challengeFor(codeVerifier);
 
@@ -352,6 +411,38 @@ async function listMessageIds(settings, { query, maxResults = DEFAULT_MAX_RESULT
   const data = await gmailFetch(settings, `/messages?${params}`);
   const messages = Array.isArray(data.messages) ? data.messages : [];
   return messages.map((message) => message.id).filter(Boolean);
+}
+
+// Every id in the window, not just the newest page of them. Gmail caps one
+// page at 500 ids, so this walks pageToken until the ceiling is reached — the
+// manual "Read & Sync" reads the whole look-back window rather than whatever
+// fits in the first 25.
+//
+// `signal` is checked between pages only, never handed to fetch(): an in-flight
+// request is allowed to land and the stop lands on the next one. That keeps a
+// stop from surfacing as an AbortError the importer would have to tell apart
+// from a real Gmail failure, and one page of latency is not something a person
+// watching the counter can feel.
+async function listAllMessageIds(settings, { query, ceiling = 1000, signal } = {}) {
+  const cap = Math.max(1, Number(ceiling) || 1000);
+  const ids = [];
+  let pageToken = "";
+
+  do {
+    if (signal && signal.aborted) break;
+    const pageSize = Math.min(MAX_RESULTS_CEILING, cap - ids.length);
+    if (pageSize < 1) break;
+    const params = new URLSearchParams({ maxResults: String(pageSize) });
+    if (query) params.set("q", query);
+    if (pageToken) params.set("pageToken", pageToken);
+
+    const data = await gmailFetch(settings, `/messages?${params}`);
+    const messages = Array.isArray(data.messages) ? data.messages : [];
+    for (const message of messages) if (message && message.id) ids.push(message.id);
+    pageToken = data.nextPageToken || "";
+  } while (pageToken && ids.length < cap);
+
+  return ids.slice(0, cap);
 }
 
 // ---- message decoding --------------------------------------------------
@@ -518,10 +609,13 @@ const Gmail = {
   isConnected,
   redirectUrl,
   requiredOrigins,
+  resolveCredentials,
+  hasCredentials,
   connect,
   disconnect,
   ensureAccessToken,
   getConnection,
   listMessageIds,
+  listAllMessageIds,
   getMessage
 };
